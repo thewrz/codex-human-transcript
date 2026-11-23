@@ -366,6 +366,21 @@ def test_agent_footer_lists_only_this_session_family(tmp_path):
     assert "mine" in text and "other" not in text
 
 
+@pytest.mark.parametrize("fields, expected", [
+    ({"agent_path": "/root/issue_1234"}, "Singer (issue_1234)"),
+    ({"source": {"subagent": {"thread_spawn": {"agent_path": "/root/team/issue_1234"}}}},
+     "Singer (team/issue_1234)"),
+    ({}, "Singer"),
+])
+def test_agent_list_shows_codename_and_orchestrator_name(tmp_path, fields, expected):
+    root = tmp_path / "sessions"
+    write_rollout(root / "rollout-worker.jsonl",
+                  [meta("subagent", id="child", agent_nickname="Singer", agent_role="worker", **fields)])
+    refs = cht.codex_discover(root)
+    footer = cht.strip_ansi(cht.agent_footer(refs, refs[0]))
+    assert footer.splitlines()[-1].split("worker", 1)[0].strip() == expected
+
+
 def test_mirror_once_across_both_roots_writes_logs_and_points_latest_at_newest_main(tmp_path):
     codex_root = tmp_path / "sessions"
     claude_root = tmp_path / "projects"

@@ -741,11 +741,28 @@ def codex_status(ref: SessionRef) -> str | None:
     return states.get(thread_id) if thread_id else None
 
 
-def spawned_parent(source: Any) -> str | None:
+def thread_spawn(source: Any) -> dict[str, Any]:
     sub = source.get("subAgent", source.get("subagent")) if isinstance(source, dict) else None
     spawn = sub.get("thread_spawn") if isinstance(sub, dict) else None
-    parent = spawn.get("parent_thread_id") if isinstance(spawn, dict) else None
+    return spawn if isinstance(spawn, dict) else {}
+
+
+def spawned_parent(source: Any) -> str | None:
+    parent = thread_spawn(source).get("parent_thread_id")
     return parent if isinstance(parent, str) and parent else None
+
+
+def agent_list_name(ref: SessionRef) -> str:
+    if ref.fmt != CODEX or ref.kind != "subagent":
+        return ref.name
+    meta = session_meta(ref.path) or {}
+    spawn = thread_spawn(meta.get("source"))
+    path = safe_label(meta.get("agent_path") or spawn.get("agent_path"), limit=256)
+    task = path.removeprefix("/root/") if path else ""
+    if not task:
+        return ref.name
+    nickname = safe_label(meta.get("agent_nickname") or spawn.get("agent_nickname"))
+    return f"{nickname or ref.name} ({task})"
 
 
 def codex_discover(root: Path) -> list[SessionRef]:
@@ -2848,9 +2865,13 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
                     lbl = f" AGENTS {live}●/{len(sessions)} " + (f"({hidden} idle hidden) " if hidden else "")
                     safe_add(stdscr, sep_row, 2, lbl, width - 3, cp(7) | curses.A_BOLD)
                     first = max(0, min(selected - list_h + 1, len(sessions) - list_h))
-                    for i, srow in enumerate(sessions[first:first + list_h]):
+                    visible = sessions[first:first + list_h]
+                    names = [agent_list_name(row) if row.kind == "subagent" else row.name[:24]
+                             for row in visible]
+                    name_width = max(24, max(map(len, names)))
+                    for i, (srow, sname) in enumerate(zip(visible, names)):
                         idx = first + i
-                        sname, srole, spath = srow.name, srow.role, srow.path
+                        srole, spath = srow.role, srow.path
                         state = states.get(spath, STATE_UNKNOWN)
                         glyph, color = GLYPHS[state]
                         marker = "▶" if idx == selected else " "
@@ -2863,7 +2884,7 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
                             cell += f" →{confirmed[spath]}"
                         label = (f"{marker} {idx + 1:>2} " + STYLE.paint(color, glyph) + " "
                                  + STYLE.paint("90", f"{srow.fmt.tag} ")
-                                 + f"{sname:<24.24} " + STYLE.paint("90", f"{srole:<10.10} ")
+                                 + f"{sname:<{name_width}} " + STYLE.paint("90", f"{srole:<10.10} ")
                                  + STYLE.paint(color, f"{state:<8}")
                                  + STYLE.paint("36", f"{session_tokens(srow):>6} ")
                                  + STYLE.paint(cell_color, f"{cell:<{MODEL_CELL_WIDTH}} ")
@@ -3027,7 +3048,7 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
 
 def agent_footer(refs: list[SessionRef], current: SessionRef | None) -> str:
     parent = current.parent_id if current else None
-    entries = [(r.name, r.role, r.path.name) for r in refs
+    entries = [(agent_list_name(r), r.role, r.path.name) for r in refs
                if r.kind == "subagent" and (parent is None or r.parent_id == parent)]
     if not entries:
         return ""
