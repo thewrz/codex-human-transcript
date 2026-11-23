@@ -2102,7 +2102,7 @@ def test_worker_effort_steps_using_live_catalog_and_confirms(tmp_path, direction
     path = write_rollout(tmp_path / "worker.jsonl", [meta(id="child")])
     ref = cht.as_ref(path)._replace(kind="subagent", session_id="child", parent_id="root")
     thread = {"id": "child", "path": str(path), "status": {"type": "active"}, "model": "worker",
-              "source": {"subagent": {"thread_spawn": {"parent_thread_id": "root"}}},
+              "source": {"subAgent": {"thread_spawn": {"parent_thread_id": "root"}}},
               "reasoningEffort": current}
     calls = []
     def rpc(method, params):
@@ -2232,4 +2232,17 @@ def test_effort_change_rechecks_worker_after_catalog_lookup(tmp_path):
         return {"data": [{"model": "m", "supportedReasoningEfforts": [
             {"reasoningEffort": "low"}, {"reasoningEffort": "high"}]}]}
     with pytest.raises(ValueError):
+        cht.adjust_worker_effort(cht.as_ref(path), 1, rpc)
+
+
+def test_spawned_worker_on_disk_reports_daemon_ownership(tmp_path):
+    path = write_rollout(tmp_path / "worker.jsonl", [meta("subagent", id="child",
+        source={"subagent": {"thread_spawn": {"parent_thread_id": "root"}}})])
+
+    def rpc(method, params):
+        assert method == "thread/read"
+        return {"thread": {"id": "child", "path": str(path), "status": {"type": "notLoaded"},
+                           "source": {"subAgent": {"thread_spawn": {"parent_thread_id": "root"}}}}}
+
+    with pytest.raises(ValueError, match="Worker is not loaded on this daemon"):
         cht.adjust_worker_effort(cht.as_ref(path), 1, rpc)

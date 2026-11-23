@@ -742,7 +742,7 @@ def codex_status(ref: SessionRef) -> str | None:
 
 
 def spawned_parent(source: Any) -> str | None:
-    sub = source.get("subagent") if isinstance(source, dict) else None
+    sub = source.get("subAgent", source.get("subagent")) if isinstance(source, dict) else None
     spawn = sub.get("thread_spawn") if isinstance(sub, dict) else None
     parent = spawn.get("parent_thread_id") if isinstance(spawn, dict) else None
     return parent if isinstance(parent, str) and parent else None
@@ -2373,10 +2373,17 @@ def adjust_worker_effort(ref: SessionRef, direction: int, rpc: Callable,
     def read_worker() -> dict:
         thread = rpc("thread/read", {"threadId": ref.session_id, "includeTurns": False})["thread"]
         parent = spawned_parent(thread.get("source"))
-        if (thread["id"] != ref.session_id or not parent or parent != ref.parent_id
-                or parent == thread["id"] or thread["status"]["type"] not in ("active", "idle")
-                or not thread.get("path") or Path(thread["path"]).resolve() != ref.path.resolve()):
-            raise ValueError("Selected rollout is not a loaded worker on this daemon")
+        if thread["id"] != ref.session_id or not parent or parent == thread["id"]:
+            raise ValueError("Daemon did not identify a spawned worker")
+        if parent != ref.parent_id:
+            raise ValueError("Worker parent differs from rollout")
+        status = thread["status"]["type"]
+        if status == "notLoaded":
+            raise ValueError("Worker is not loaded on this daemon")
+        if status not in ("active", "idle"):
+            raise ValueError(f"Worker unavailable: {status}")
+        if not thread.get("path") or Path(thread["path"]).resolve() != ref.path.resolve():
+            raise ValueError("Worker rollout path differs on daemon")
         return thread
 
     thread = read_worker()
