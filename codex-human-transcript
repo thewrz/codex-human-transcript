@@ -1,0 +1,2999 @@
+#!/usr/bin/env python3
+"""codex-human-transcript — fast, colorful TUI over Codex rollout NDJSON transcripts.
+
+Interactive mode (default on a tty): incremental NDJSON tailing with a per-file
+render cache, ANSI-color rendering inside curses, vim-style keys, search, mouse
+wheel, and dirty-flag redraws so it stays snappy in tmux over bad links.
+Plain mode (--plain / piped / --once) keeps the original stream-to-stdout flow.
+
+Text logs: every mode can mirror sessions into plain-text files (no JSON, no
+ANSI) that humans and agents can `tail -F`. `--mirror` does only that, headless:
+
+    codex-human-transcript --mirror &
+    tail -F ~/.local/state/codex-human-transcript/logs/latest.log
+
+Roots: Codex sessions dirs ($CODEX_HOME, ~/.codex, WSL-mounted Windows profiles) and
+Claude Code project dirs ($CLAUDE_CONFIG_DIR, ~/.claude/projects, WSL profiles) are both
+auto-discovered. Press `r` in the TUI to pick which roots to watch; the selection is saved
+in ~/.config/codex-human-transcript/config.json. Sessions from both agents share one list,
+tagged CX / CL. Press `t` to hide Claude thinking blocks (text logs always keep them).
+
+Status: Codex sessions read their state from Codex's own thread database beside the sessions
+dir (a turn in flight stays "working" however long its rollout grows) and take their names from
+it; Claude sessions are read from the transcript, with `/slash` commands ignored and names from
+history.jsonl. A "working" session nobody wrote to for an hour shows as stale. Press `a` (or pass
+`--active`) to hide idle sessions older than that window; `--active-window 30m` tunes it.
+
+Token usage: sessions are tallied from the transcript itself (Codex `token_count` events,
+Claude per-message `usage`), so watching costs the agent nothing. `--mirror` tallies every
+session it mirrors; the TUI tallies the sessions you open and shows earlier totals from the ledger.
+The footer shows `Σ ↑input ⇄cache-hit% ↓output · requests · tools · errors · ctx`, the row above
+it shows the current `⚙ model · effort`, the agent list carries both per session, and one
+JSON per session lands in ~/.local/state/codex-human-transcript/ledger/ for comparing
+sessions over time (`jq -s . ledger/*.json`). `--no-ledger` turns the files off.
+"""
+
+from __future__ import annotations
+
+import argparse
+import codecs
+import contextlib
+import curses
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+import time
+from collections import deque
+from pathlib import Path
+from collections.abc import Callable, Iterable
+from typing import Any, NamedTuple
+
+SECRET_KEYS = re.compile(r"(token|secret|password|authorization|api[_-]?key|cookie)", re.I)
+ANSI_RE = re.compile(r"\033\[([0-9;]*)m")
+CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1a\x1c-\x1f]")
+# Terminal escape sequences that untrusted transcript content can carry: OSC/DCS/APC/PM/SOS
+# "string" sequences (ESC + one of ]PX^_ ... terminated by BEL or ST — e.g. OSC 52 clipboard
+# writes) and CSI sequences (ESC [ ... final byte, which also covers SGR colour codes). Both
+# match to end-of-string when the terminator is missing (mid-write truncation), so a dangling
+# opener can't survive either. Used only on untrusted text in clean(), before the tool's own
+# STYLE.paint() adds its trusted SGR codes.
+UNTRUSTED_STRING_SEQ_RE = re.compile(r"\033[\]PX^_](?:[^\033\007]|\033(?!\\))*(?:\007|\033\\)?")
+UNTRUSTED_CSI_RE = re.compile(r"\033\[[0-9:;<=>?]*[ -/]*[@-~]?")
+MAX_CACHED_LINES = 8000
+BACKFILL_BYTES = 512 * 1024
+READ_CHUNK_BYTES = 1048576        # max bytes absorbed per tail pass
+MAX_RECORD_BYTES = 4194304        # a single record larger than this is skipped, not buffered
+RESCAN_SECS = 5.0
+BG_UPDATE_SECS = 2.0
+RECENT_DAYS = 14          # how many YYYY/MM/DD day-dirs to scan for live sessions
+MAIN_LIMIT = 3
+SUBAGENT_LIMIT = 20
+SNIFF_BYTES = 262144      # how much of an undecided file to read while sniffing its format
+SNIFF_RECORDS = 50        # how many leading lines of that sniff to try to parse as JSON
+SCAN_CHUNK = 65536        # backward state scan starts with this many bytes and doubles per pass
+MAX_SCAN_BYTES = 16 * 1048576  # ...until this ceiling, beyond which state is reported as unknown
+MAX_DB_CACHE_SECS = 30.0  # re-query Codex's database at least this often, whatever its mtime says
+DEFAULT_ACTIVE_WINDOW_SECS = 3600.0  # no transcript write for this long: working → stale, idle → hidden
+
+APP_NAME = "codex-human-transcript"
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+XDG_STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+DEFAULT_CONFIG = XDG_CONFIG / APP_NAME / "config.json"
+DEFAULT_LOG_DIR = XDG_STATE / APP_NAME / "logs"
+LATEST_LOG = "latest.log"
+DEFAULT_LEDGER_DIR = XDG_STATE / APP_NAME / "ledger"
+LEDGER_VERSION = 1
+USAGE_ID_WINDOW = 16      # recent Claude message ids remembered for usage de-duplication
+
+COLORS_OK = False
+
+
+class Style:
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+
+    def paint(self, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.enabled else text
+
+
+STYLE = Style(False)
+
+
+# ── NDJSON → readable text ──────────────────────────────────────────────────
+
+REDACTED = "[REDACTED]"
+
+
+def redact(value: Any, depth: int = 0) -> Any:
+    """Recursively mask values whose key looks secret; leaves other values untouched."""
+    if depth > 12:
+        return REDACTED if isinstance(value, (dict, list)) else value
+    if isinstance(value, dict):
+        return {str(k): (REDACTED if SECRET_KEYS.search(str(k)) else redact(v, depth + 1))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(item, depth + 1) for item in value]
+    return value
+
+
+def clean(value: Any, limit: int = 1200) -> str:
+    dumped = not isinstance(value, str)
+    if isinstance(value, (dict, list)):
+        value = redact(value)
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    # Strip any terminal escape sequences the untrusted source embedded (OSC/DCS/APC/PM/SOS,
+    # CSI) before this text is ever styled or printed — see UNTRUSTED_STRING_SEQ_RE above.
+    text = UNTRUSTED_STRING_SEQ_RE.sub("", text)
+    text = UNTRUSTED_CSI_RE.sub("", text)
+    text = text.replace("\033", "")  # catch-all for any other ESC-introduced sequence
+    text = re.sub(r"gAAAA[A-Za-z0-9_-]{40,}", "[ENCRYPTED/REDACTED]", text)
+    text = re.sub(r"(Bearer\s+)[^\s\"']+", r"\1[REDACTED]", text, flags=re.I)
+    text = re.sub(r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=_-]{64,}",
+                  "⟦inline image⟧", text)
+    text = re.sub(r"[A-Za-z0-9+/=_-]{300,}", "⟦blob⟧", text)
+    if dumped:  # only JSON-escaped text carries escape sequences worth unescaping
+        text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "    ")
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def text_from_content(content: Any) -> str:
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") in {"output_text", "input_text"}:
+            parts.append(str(item.get("text", "")))
+    return "\n".join(p for p in parts if p)
+
+
+def texts_from_json_list(value: Any) -> str | None:
+    """Codex tool outputs are often a list of {"type":"text","text":…} — raw or JSON-encoded."""
+    parsed = value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(parsed, list):
+        return None
+    chunks = [str(item["text"]) for item in parsed
+              if isinstance(item, dict) and item.get("text")]
+    if not chunks:
+        return None
+    return re.sub(r'\s*"\}\]\s*$', "", "\n".join(chunks))
+
+
+def readable_tool_output(value: Any) -> str:
+    text = texts_from_json_list(value)
+    return clean(text) if text is not None else clean(value)
+
+
+EXEC_EXIT_RE = re.compile(r"Process exited with code (-?\d+)")
+EXEC_WALL_RE = re.compile(r"Wall time: ([\d.]+) seconds")
+EXEC_NOISE = ("Chunk ID:", "Original token count:")
+
+
+def split_exec_header(text: str) -> tuple[str, str]:
+    """Collapse Codex's exec_command header block into one summary line."""
+    lines = text.split("\n", 8)
+    for i, line in enumerate(lines[:8]):
+        if line.strip() != "Output:":
+            continue
+        head, body = lines[:i], "\n".join(lines[i + 1:])
+        summary = []
+        for entry in head:
+            if entry.startswith(EXEC_NOISE):
+                continue
+            exit_match, wall_match = EXEC_EXIT_RE.match(entry), EXEC_WALL_RE.match(entry)
+            if exit_match:
+                summary.append(f"exit {exit_match.group(1)}")
+            elif wall_match:
+                summary.append(f"{float(wall_match.group(1)):.2f}s")
+            elif entry.strip():
+                summary.append(entry.strip())
+        return " · ".join(summary), body
+    return "", text
+
+
+MD_ON = True
+
+
+def inline_md(line: str) -> str:
+    line = re.sub(r"\*\*(.+?)\*\*", lambda m: STYLE.paint("1", m.group(1)), line)
+    line = re.sub(r"(?<![`\w])\*([^*\s][^*]*?)\*(?!\w)", lambda m: STYLE.paint("3", m.group(1)), line)
+    line = re.sub(r"`([^`]+)`", lambda m: STYLE.paint("93", m.group(1)), line)
+    line = re.sub(r"\[([^\]]+)\]\(([^)]+)\)",
+                  lambda m: STYLE.paint("4;36", m.group(1)) + STYLE.paint("2", f" ({m.group(2)})"), line)
+    return line
+
+
+def md_ansi(text: str) -> str:
+    """Tiny markdown → ANSI: headings, bold/italic/code, fences, bullets, quotes, links."""
+    out = []
+    in_code = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            lang = stripped[3:].strip()
+            out.append(STYLE.paint("90", "┄┄ " + (lang or "code") + " ┄┄"))
+            continue
+        if in_code:
+            out.append(STYLE.paint("33", line))
+            continue
+        heading = re.match(r"(#{1,6})\s+(.*)", stripped)
+        if heading:
+            out.append(STYLE.paint("1;4;36", heading.group(2)))
+            continue
+        if stripped.startswith(">"):
+            out.append(STYLE.paint("2;3", line.replace(">", "┃", 1)))
+            continue
+        if re.match(r"\s*([-*_])\s*\1\s*\1[\s\-*_]*$", line):
+            out.append(STYLE.paint("90", "─" * 30))
+            continue
+        line = re.sub(r"^(\s*)[-*+]\s+", lambda m: m.group(1) + STYLE.paint("36", "•") + " ", line)
+        line = re.sub(r"^(\s*)(\d+)\.\s+", lambda m: m.group(1) + STYLE.paint("36", m.group(2) + ".") + " ", line)
+        out.append(inline_md(line))
+    return "\n".join(out)
+
+
+def prose(text: str) -> str:
+    return md_ansi(text) if MD_ON else text
+
+
+def block(stamp: str, color: str, badge: str, body: str) -> str:
+    """A titled block: glyph badge + dim timestamp, body behind a colored gutter rail."""
+    head = STYLE.paint("1;" + color, badge) + (STYLE.paint("90", f"  {stamp}") if stamp else "")
+    rail = STYLE.paint(color, "▎")
+    lines = [head]
+    lines.extend(f"{rail} {line}" for line in body.splitlines() or [""])
+    return "\n".join(lines) + "\n"
+
+
+def parse_json_object(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def kv_lines(args: dict[str, Any], limit: int = 400) -> str:
+    safe = redact(args)
+    return "\n".join(f"{key}: {clean(value, limit)}" for key, value in safe.items())
+
+
+AGENT_TOOLS = {"spawn_agent", "send_message", "wait_agent", "close_agent", "list_agents",
+               "followup_task", "resume_agent"}
+PLAN_GLYPHS = {"completed": "✔", "in_progress": "▶", "pending": "○"}
+
+Renderer = Callable[[str, dict[str, Any]], str | None]
+
+
+def render_codex(stamp: str, payload: dict[str, Any]) -> str | None:
+    return block(stamp, "36", "◆ CODEX", prose(clean(payload.get("message", ""))))
+
+
+def render_done(stamp: str, payload: dict[str, Any]) -> str | None:
+    return block(stamp, "32", "✔ DONE", prose(clean(payload.get("last_agent_message", ""))))
+
+
+def render_you(stamp: str, payload: dict[str, Any]) -> str | None:
+    return block(stamp, "35", "❯ YOU", prose(clean(payload.get("message", payload.get("text", "")))))
+
+
+def render_message(stamp: str, payload: dict[str, Any]) -> str | None:
+    role = payload.get("role", "assistant")
+    if role in {"developer", "system"}:
+        return None
+    message = text_from_content(payload.get("content"))
+    if not message:
+        return None
+    if role == "user":
+        return block(stamp, "35", "❯ YOU", prose(clean(message)))
+    return block(stamp, "36", "◆ CODEX", prose(clean(message)))
+
+
+def render_custom_tool_call(stamp: str, payload: dict[str, Any]) -> str | None:
+    name = str(payload.get("name", "tool"))
+    body = payload.get("input", "")
+    if name == "exec" and isinstance(body, str):
+        return block(stamp, "33", "⚙ EXEC ⇢", "$ " + clean(body))
+    return block(stamp, "33", f"⚙ TOOL ⇢ {name}", clean(body))
+
+
+def render_custom_tool_output(stamp: str, payload: dict[str, Any]) -> str | None:
+    return block(stamp, "33", "⚙ TOOL ⇠", readable_tool_output(payload.get("output", "")))
+
+
+def render_function_call(stamp: str, payload: dict[str, Any]) -> str | None:
+    name = str(payload.get("name", "tool"))
+    args = parse_json_object(payload.get("arguments")) or {}
+    if name == "exec_command":
+        body = "$ " + clean(str(args.get("cmd", "")))
+        if args.get("workdir"):
+            body += "\n" + STYLE.paint("90", f"in {args['workdir']}")
+        return block(stamp, "33", "⚙ EXEC ⇢", body)
+    if name == "write_stdin":
+        return block(stamp, "33", "⚙ STDIN ⇢", clean(str(args.get("chars", ""))))
+    if name == "wait":
+        return block(stamp, "90", "⏳ WAIT", kv_lines(args))
+    if name == "update_plan":
+        return block(stamp, "34", "📋 PLAN", plan_lines(args))
+    if name in AGENT_TOOLS:
+        return block(stamp, "95", f"👥 AGENT ⇢ {name}", kv_lines(args))
+    if not args:
+        return block(stamp, "33", f"⚙ TOOL ⇢ {name}", clean(payload.get("arguments", "")))
+    return block(stamp, "33", f"⚙ TOOL ⇢ {name}", kv_lines(args))
+
+
+def plan_lines(args: dict[str, Any]) -> str:
+    lines = []
+    if args.get("explanation"):
+        lines.append(clean(str(args["explanation"]), 300))
+    for step in args.get("plan") or []:
+        if not isinstance(step, dict):
+            continue
+        status = str(step.get("status", "pending"))
+        glyph = PLAN_GLYPHS.get(status, "?")
+        lines.append(f"{glyph} {clean(str(step.get('step', '')), 200)}  {STYLE.paint('90', status)}")
+    return "\n".join(lines) or kv_lines(args)
+
+
+def render_function_output(stamp: str, payload: dict[str, Any]) -> str | None:
+    raw = payload.get("output", "")
+    text = texts_from_json_list(raw)
+    if text is None:
+        text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+    summary, body = split_exec_header(text)
+    body = clean(body)
+    if summary:
+        body = STYLE.paint("90", summary) + ("\n" + body if body.strip() else "")
+    return block(stamp, "33", "⚙ TOOL ⇠", body)
+
+
+def render_patch(stamp: str, payload: dict[str, Any]) -> str | None:
+    ok = str(payload.get("success", "")).lower() == "true"
+    body = clean(str(payload.get("stdout", "")).rstrip())
+    stderr = str(payload.get("stderr", "")).strip()
+    if stderr:
+        body += ("\n" if body else "") + clean(stderr)
+    return block(stamp, "32" if ok else "31", "✎ PATCH" + ("" if ok else " FAILED"), body)
+
+
+def render_search(stamp: str, payload: dict[str, Any]) -> str | None:
+    return block(stamp, "34", "🔍 SEARCH", clean(str(payload.get("query", ""))))
+
+
+def render_mcp(stamp: str, payload: dict[str, Any]) -> str | None:
+    invocation = parse_json_object(payload.get("invocation")) or {}
+    label = f"{invocation.get('server', '?')}/{invocation.get('tool', '?')}"
+    result = parse_json_object(payload.get("result")) or {}
+    content = (result.get("Ok") or {}).get("content") if isinstance(result.get("Ok"), dict) else None
+    body = texts_from_json_list(json.dumps(content)) if content else None
+    if body is None:
+        body = clean(result.get("Err", result) if result else payload.get("result", ""))
+    return block(stamp, "33", f"⚙ MCP ⇠ {label}", clean(body))
+
+
+def render_aborted(stamp: str, payload: dict[str, Any]) -> str | None:
+    return block(stamp, "31", "✘ ABORTED", clean(str(payload.get("reason", ""))))
+
+
+def render_error(stamp: str, payload: dict[str, Any]) -> str | None:
+    return block(stamp, "31", "✘ ERROR", clean(payload))
+
+
+def render_approval(stamp: str, payload: dict[str, Any]) -> str | None:
+    return block(stamp, "31", "⚠ APPROVAL / QUESTION", clean(payload))
+
+
+def render_compacted(stamp: str, payload: dict[str, Any]) -> str | None:
+    return block(stamp, "90", "⟲ COMPACTED", "context compacted")
+
+
+RENDERERS: dict[str, Renderer] = {
+    "agent_message": render_codex,
+    "task_complete": render_done,
+    "user_message": render_you,
+    "message": render_message,
+    "custom_tool_call": render_custom_tool_call,
+    "custom_tool_call_output": render_custom_tool_output,
+    "function_call": render_function_call,
+    "function_call_output": render_function_output,
+    "patch_apply_end": render_patch,
+    "web_search_end": render_search,
+    "mcp_tool_call_end": render_mcp,
+    "turn_aborted": render_aborted,
+    "error": render_error,
+    "task_failed": render_error,
+    "request_user_input": render_approval,
+    "context_compacted": render_compacted,
+}
+
+
+def payload_kind(record: dict[str, Any]) -> str | None:
+    payload = record.get("payload")
+    return payload.get("type") if isinstance(payload, dict) else None
+
+
+def render(record: dict[str, Any]) -> str | None:
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    kind = str(payload.get("type") or "")
+    stamp = str(record.get("timestamp", ""))[:19].replace("T", " ")
+    handler = RENDERERS.get(kind)
+    if handler is None and kind.endswith("approval_request"):
+        handler = render_approval
+    return handler(stamp, payload) if handler else None
+
+
+def next_state(kind: str | None, state: str) -> str:
+    if kind == "task_started":
+        return "working"
+    if kind == "task_complete":
+        return "done"
+    if kind in {"error", "task_failed"}:
+        return "error"
+    return state
+
+
+def records(stream: Iterable[str]):
+    for line in stream:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            yield record
+
+
+class Deduper:
+    """Codex logs the same assistant/user text twice (event_msg + response_item)."""
+
+    def __init__(self, window: int = 4):
+        self.recent: deque[tuple[str, str]] = deque(maxlen=window)
+
+    def fresh(self, rendered: str) -> bool:
+        head, _, body = strip_ansi(rendered).partition("\n")
+        key = (head.split("  ")[0], body)
+        if key in self.recent:
+            return False
+        self.recent.append(key)
+        return True
+
+
+# ── SessionRef / Format seam (format-neutral layers consume these) ─────────
+
+STATE_WORKING, STATE_DONE, STATE_ERROR, STATE_UNKNOWN = "working", "done", "error", "unknown"
+STATE_STALE = "stale"     # reported working, but nobody has written to the transcript for a while
+
+DISPLAY_OPTS: dict[str, Any] = {"thinking": True}     # TUI + stdout only
+MIRROR_OPTS: dict[str, Any] = {"thinking": True}      # constant: logs are stable artifacts
+
+
+_UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe_id_segment(value: str) -> str:
+    """Make an attacker-controlled id both filesystem-safe AND collision-free.
+
+    `owner_id`/`agent_id` are read verbatim from session content (e.g. a rollout file's own
+    `session_meta.id`), so they must never be trusted as filesystem path segments. Stripping
+    unsafe characters alone is not injective (`"a/b"` and `"ab"` would strip to the same
+    string), so a short digest of the raw value is always appended to keep distinct ids
+    distinct even after stripping.
+    """
+    cleaned = _UNSAFE_ID_CHARS.sub("", value)
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    return f"{cleaned}-{digest}" if cleaned else digest
+
+
+def source_key(fmt_name: str, root: Path, owner_id: str, agent_id: str | None = None) -> str:
+    """Stable, collision-free identity for one source file under one root."""
+    digest = hashlib.sha256(str(Path(root).resolve()).encode("utf-8")).hexdigest()[:8]
+    safe_owner = _safe_id_segment(owner_id)
+    tail = f"-{_safe_id_segment(agent_id)}" if agent_id else ""
+    return f"{fmt_name}-{digest}-{safe_owner}{tail}"
+
+
+class Format:
+    """Everything format-specific: discovery, metadata, rendering, state."""
+
+    def __init__(self, name: str, tag: str, discover: Callable[[Path], list[SessionRef]],
+                meta: Callable[[Path], dict[str, Any] | None],
+                render: Callable[[dict[str, Any], dict[str, Any]], str | None],
+                advance: Callable[[str, dict[str, Any]], str],
+                scan_state: Callable[[Path], str], dedupe: bool,
+                usage_feed: Callable[[dict[str, Any], dict[str, Any]], None],
+                status: Callable[[SessionRef], str | None] | None = None):
+        self.name = name
+        self.tag = tag
+        self.discover = discover
+        self.meta = meta
+        self.render = render
+        self.advance = advance
+        self.scan_state = scan_state
+        self.dedupe = dedupe
+        self.usage_feed = usage_feed
+        self.status = status
+
+
+class SessionRef(NamedTuple):
+    fmt: Format
+    path: Path
+    kind: str                 # "main" | "subagent"
+    session_id: str | None
+    parent_id: str | None
+    agent_id: str | None
+    name: str
+    role: str
+    cwd: str | None
+    mtime: float
+    source_key: str
+
+
+def codex_render(record: dict[str, Any], opts: dict[str, Any]) -> str | None:
+    return render(record)                      # opts unused: Codex reasoning is encrypted
+
+
+def codex_advance(state: str, record: dict[str, Any]) -> str:
+    return next_state(payload_kind(record), state)
+
+
+def codex_scan_state(path: Path) -> str:
+    return scan_state(path, CODEX)
+
+
+USAGE_KEYS = ("input", "cache_read", "cache_write", "output", "thinking", "requests", "tool_calls",
+              "tool_errors", "last_context")
+
+
+def _add(state: dict[str, Any], key: str, amount: int) -> None:
+    state[key] = _as_int(state.get(key)) + amount
+
+
+def _as_int(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _exit_failed(output: Any) -> bool:
+    """True when a Codex exec-style output header reports a nonzero exit code."""
+    text = texts_from_json_list(output)
+    if text is None:
+        text = output if isinstance(output, str) else ""
+    for line in text.split("\n", 8)[:8]:
+        match = EXEC_EXIT_RE.match(line)
+        if match:
+            return match.group(1) != "0"
+    return False
+
+
+def _codex_token_count(state: dict[str, Any], info: Any) -> None:
+    total = info.get("total_token_usage") if isinstance(info, dict) else None
+    if not isinstance(total, dict):
+        return
+    cached, written = _as_int(total.get("cached_input_tokens")), _as_int(total.get("cache_write_input_tokens"))
+    state.update(input=max(0, _as_int(total.get("input_tokens")) - cached - written),
+                 cache_read=cached, cache_write=written, output=_as_int(total.get("output_tokens")),
+                 thinking=_as_int(total.get("reasoning_output_tokens")))
+    _add(state, "requests", 1)
+    last = info.get("last_token_usage")
+    if isinstance(last, dict):
+        state["last_context"] = _as_int(last.get("input_tokens"))
+    if _as_int(info.get("model_context_window")) > 0:
+        state["context_window"] = _as_int(info.get("model_context_window"))
+
+
+def codex_usage_feed(state: dict[str, Any], record: dict[str, Any]) -> None:
+    """Fold one rollout record into the usage accumulator (see UsageCounter).
+
+    Codex reports a cumulative `total_token_usage` on every `token_count`, so tokens are
+    last-wins; tool calls and failures are counted from the response items themselves."""
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return
+    kind = payload.get("type")
+    if kind == "token_count":
+        _codex_token_count(state, payload.get("info"))
+    elif record.get("type") == "turn_context" or kind == "turn_context":   # a top-level record in real rollouts
+        if payload.get("model"):
+            state["model"] = str(payload["model"])
+        if payload.get("effort"):
+            state["effort"] = str(payload["effort"])
+    elif kind in {"function_call", "custom_tool_call"}:
+        _add(state, "tool_calls", 1)
+    elif kind in {"function_call_output", "custom_tool_call_output"}:
+        if _exit_failed(payload.get("output")):
+            _add(state, "tool_errors", 1)
+    elif kind == "patch_apply_end" and str(payload.get("success", "")).lower() != "true":
+        _add(state, "tool_errors", 1)
+
+
+# Codex keeps its own truth beside the sessions dir: thread_turns.status says whether a turn is
+# in flight (no matter how long its rollout grew), and threads carries the human names. Both are
+# read read-only and cached until the database (or its WAL) changes.
+# (db, sql, params) → (last checked, file signature, data, last actually queried)
+_DB_CACHE: dict[tuple[Path, str, tuple], tuple[float, tuple[float, ...], Any, float]] = {}
+CODEX_TURN_STATES = {"inProgress": STATE_WORKING, "completed": STATE_DONE,
+                     "interrupted": STATE_DONE, "failed": STATE_ERROR}
+ROLLOUT_ID_RE = re.compile(r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(.+)$")
+LABEL_LIMIT = 40
+
+
+def _db_file(home: Path, stem: str) -> Path | None:
+    try:
+        matches = sorted(home.glob(f"{stem}_*.sqlite"), key=lambda p: p.name)
+    except OSError:
+        return None
+    return matches[-1] if matches else None
+
+
+def _db_signature(db: Path) -> tuple[float, ...]:
+    sig = []
+    for candidate in (db, db.with_name(db.name + "-wal")):
+        try:
+            sig.append(candidate.stat().st_mtime)
+        except OSError:
+            sig.append(-1.0)
+    return tuple(sig)
+
+
+def _db_query(db: Path, sql: str, params: tuple, load: Callable[[list[tuple]], Any]) -> Any | None:
+    """Read-only query, re-run when the database changed, at most every BG_UPDATE_SECS and at least
+    every MAX_DB_CACHE_SECS (mtimes lag on Windows while a WAL file stays open). Failures are cached
+    like results so a locked database costs one timeout per cadence, not one per session.
+
+    Opening a WAL database read-only may still create its `-shm` sidecar; Codex keeps those
+    sidecars itself while running, and the alternative (`immutable=1`) would read stale pages."""
+    key, now = (db, sql, params), time.monotonic()
+    hit = _DB_CACHE.get(key)
+    if hit and now - hit[0] < BG_UPDATE_SECS:
+        return hit[2]
+    sig = _db_signature(db)
+    if hit and hit[1] == sig and now - hit[3] < MAX_DB_CACHE_SECS:
+        _DB_CACHE[key] = (now, sig, hit[2], hit[3])
+        return hit[2]
+    data = None
+    try:
+        con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=0.2)
+        try:
+            data = load(con.execute(sql, params).fetchall())
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError):
+        data = None
+    _DB_CACHE[key] = (now, sig, data, now)
+    return data
+
+
+def codex_home(path: Path) -> Path | None:
+    """$CODEX_HOME for a rollout: the parent of its `sessions` directory."""
+    return next((parent.parent for parent in path.parents if parent.name == "sessions"), None)
+
+
+def codex_thread_id(path: Path) -> str | None:
+    match = ROLLOUT_ID_RE.match(path.stem)
+    return match.group(1) if match else None
+
+
+def codex_turn_states(home: Path) -> dict[str, str] | None:
+    """thread id → state from the newest turn of each thread; None when Codex keeps no database here."""
+    db = _db_file(home, "thread_history")
+    if db is None:
+        return None
+    sql = ("select thread_id, status from thread_turns t where rollout_ordinal = "
+           "(select max(rollout_ordinal) from thread_turns x where x.thread_id = t.thread_id)")
+    return _db_query(db, sql, (), lambda rows: {str(t): CODEX_TURN_STATES.get(str(s), STATE_UNKNOWN)
+                                                for t, s in rows})
+
+
+def _thread_label(name: Any, nickname: Any, title: Any) -> str | None:
+    for candidate in (name, nickname, title):
+        text = str(candidate or "").strip().split("\n", 1)[0].strip()
+        if text:
+            return text[:LABEL_LIMIT]
+    return None
+
+
+def codex_thread_names(home: Path) -> dict[str, tuple[str, str | None]]:
+    """thread id → (label, agent role) for threads touched within RECENT_DAYS."""
+    db = _db_file(home, "state")
+    if db is None:
+        return {}
+    since = int((time.time() - RECENT_DAYS * 86400) * 1000)
+    sql = "select id, name, agent_nickname, title, agent_role from threads where updated_at_ms > ?"
+
+    def load(rows: list[tuple]) -> dict[str, tuple[str, str | None]]:
+        out = {}
+        for tid, name, nick, title, role in rows:
+            label = _thread_label(name, nick, title)
+            if label:
+                out[str(tid)] = (label, str(role) if role else None)
+        return out
+    return _db_query(db, sql, (since,), load) or {}
+
+
+def codex_status(ref: SessionRef) -> str | None:
+    home = codex_home(ref.path)
+    states = codex_turn_states(home) if home is not None else None
+    if not states:
+        return None
+    thread_id = codex_thread_id(ref.path) or ref.session_id
+    return states.get(thread_id) if thread_id else None
+
+
+def codex_discover(root: Path) -> list[SessionRef]:
+    refs: list[SessionRef] = []
+    home = codex_home(root / "x")
+    labels = codex_thread_names(home) if home is not None else {}
+    for name, role, path in discover_sessions(root):
+        info = session_meta(path) or {}
+        identity = subagent_identity(info)
+        sid = str(info.get("id") or path.stem)
+        label = labels.get(sid)
+        if label:
+            name, role = label[0], label[1] or role
+        refs.append(SessionRef(
+            fmt=CODEX, path=path, kind="subagent" if identity else "main",
+            session_id=sid, parent_id=str(info.get("parent_thread_id") or sid),
+            agent_id=path.stem if identity else None, name=name, role=role,
+            cwd=info.get("cwd"), mtime=_mtime(path) or 0.0,
+            source_key=source_key("codex", root, sid, path.stem if identity else None)))
+    return refs
+
+
+# ── session discovery (metadata cached — first line never changes) ──────────
+
+_META_CACHE: dict[Path, dict[str, Any] | None] = {}
+
+
+def session_meta(path: Path) -> dict[str, Any] | None:
+    if path in _META_CACHE:
+        return _META_CACHE[path]
+    meta: dict[str, Any] | None = None
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            first = json.loads(handle.readline())
+        if isinstance(first, dict) and first.get("type") == "session_meta":
+            payload = first.get("payload")
+            meta = payload if isinstance(payload, dict) else None
+    except (OSError, json.JSONDecodeError):
+        pass
+    _META_CACHE[path] = meta
+    return meta
+
+
+def subagent_identity(meta: dict[str, Any]) -> tuple[str, str] | None:
+    if meta.get("thread_source") != "subagent":
+        return None
+    # source.subagent is a dict ({"thread_spawn": …} / {"other": …}) or a bare kind ("review")
+    source = meta.get("source")
+    sub = source.get("subagent") if isinstance(source, dict) else None
+    spawn = sub.get("thread_spawn") if isinstance(sub, dict) else None
+    spawn = spawn if isinstance(spawn, dict) else {}
+    kind = sub if isinstance(sub, str) else next(iter(sub), None) if isinstance(sub, dict) else None
+    name = meta.get("agent_nickname") or spawn.get("agent_nickname") or "unnamed"
+    role = meta.get("agent_role") or spawn.get("agent_role") or (kind if kind != "thread_spawn" else None) or "subagent"
+    return str(name), str(role)
+
+
+def has_completed(path: Path) -> bool:
+    return scan_state(path, CODEX) == STATE_DONE
+
+
+def _mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _day_dirs(root: Path) -> list[Path]:
+    """Codex lays sessions out as <root>/YYYY/MM/DD/rollout-*.jsonl."""
+    days: list[Path] = []
+    try:
+        for year in root.iterdir():
+            if not (year.is_dir() and year.name.isdigit() and len(year.name) == 4):
+                continue
+            for month in year.iterdir():
+                if not (month.is_dir() and month.name.isdigit()):
+                    continue
+                days.extend(d for d in month.iterdir() if d.is_dir() and d.name.isdigit())
+    except OSError:
+        return []
+    return sorted(days, key=lambda d: d.parts[-3:])
+
+
+def recent_rollouts(root: Path, days: int = RECENT_DAYS) -> list[Path]:
+    """Rollouts from the newest `days` day-directories (full scan for flat layouts)."""
+    if not root.is_dir():
+        return []
+    day_dirs = _day_dirs(root)
+    try:
+        if not day_dirs:
+            return list(root.rglob("rollout-*.jsonl"))
+        files: list[Path] = []
+        for day in day_dirs[-days:]:
+            files.extend(day.glob("rollout-*.jsonl"))
+        return files
+    except OSError:
+        return []
+
+
+def newest_main(refs: list[SessionRef]) -> SessionRef | None:
+    mains = [r for r in refs if r.kind == "main"]
+    return max(mains, key=lambda r: r.mtime, default=None)
+
+
+def newest_transcript(root: Path, fmt: Format | None = None) -> Path | None:
+    """Newest main session under `root`, in whichever format wrote it."""
+    ref = newest_main((fmt or detect_root_format(root) or CODEX).discover(root))
+    return ref.path if ref else None
+
+
+def discover_sessions(root: Path) -> list[tuple[str, str, Path]]:
+    """Newest main sessions first, then subagents (newest first)."""
+    mains: list[tuple[float, Path]] = []
+    subs: list[tuple[float, str, str, Path]] = []
+    for path in recent_rollouts(root):
+        mtime = _mtime(path)
+        if mtime is None:
+            continue
+        meta = session_meta(path)
+        identity = subagent_identity(meta) if meta else None
+        if identity:
+            subs.append((mtime, identity[0], identity[1], path))
+        else:
+            mains.append((mtime, path))
+    mains.sort(key=lambda item: item[0], reverse=True)
+    subs.sort(key=lambda item: item[0], reverse=True)
+    out = [("main" if i == 0 else path.stem[-8:], "session", path)
+           for i, (_, path) in enumerate(mains[:MAIN_LIMIT])]
+    out.extend((name, role, path) for _, name, role, path in subs[:SUBAGENT_LIMIT])
+    return out
+
+
+CODEX = Format("codex", "CX", codex_discover, session_meta, codex_render,
+              codex_advance, codex_scan_state, dedupe=True, usage_feed=codex_usage_feed,
+              status=codex_status)
+
+
+def as_ref(source: Path | SessionRef) -> SessionRef:
+    """Lets TranscriptCache/TextLog/follow() accept a bare Path (format auto-detected,
+    falling back to Codex when undecidable) or a real SessionRef."""
+    if isinstance(source, SessionRef):
+        return source
+    path = source
+    fmt = detect_format(path) or CODEX
+    if fmt.name == "claude":
+        cwd = claude_meta(path).get("cwd")
+        return SessionRef(fmt, path, "main", path.stem, path.stem, None, path.stem[-12:],
+                          "session", cwd, _mtime(path) or 0.0, source_key("claude", path.parent, path.stem))
+    return SessionRef(fmt, path, "main", path.stem, path.stem, None, path.stem[-12:],
+                      "session", None, _mtime(path) or 0.0, source_key(fmt.name, path.parent, path.stem))
+
+
+def _sidecar(path: Path) -> dict[str, Any]:
+    side = path.with_suffix(".meta.json")
+    try:
+        data = json.loads(side.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _recent(mtime: float, days: int = RECENT_DAYS) -> bool:
+    return (time.time() - mtime) <= days * 86400
+
+
+def _claude_subagents(root: Path, session_dir: Path, parent_id: str) -> list[SessionRef]:
+    out: list[SessionRef] = []
+    try:
+        entries = list(os.scandir(session_dir / "subagents"))
+    except OSError:
+        return out
+    for entry in entries:
+        if not (entry.is_file() and entry.name.startswith("agent-") and entry.name.endswith(".jsonl")):
+            continue
+        mtime = entry.stat().st_mtime
+        if not _recent(mtime):                 # eligibility is the agent's own age, not its parent's
+            continue
+        agent_id = Path(entry.name).stem
+        side = _sidecar(Path(entry.path))
+        name = str(side.get("description") or agent_id)[:40]
+        role = str(side.get("agentType") or "subagent")
+        out.append(SessionRef(FORMATS["claude"], Path(entry.path), "subagent", None, parent_id,
+                              agent_id, name, role, None, mtime,
+                              source_key("claude", root, parent_id, agent_id)))
+    return out
+
+
+_CLAUDE_META: dict[Path, tuple[tuple[int, float], dict[str, Any]]] = {}
+CLAUDE_META_FIELDS = ("cwd", "gitBranch", "version")
+
+
+def claude_meta(path: Path) -> dict[str, Any]:
+    """Collect each field independently; incomplete results are re-read when the file grows."""
+    try:
+        st = path.stat()
+        stamp = (st.st_size, st.st_mtime)
+    except OSError:
+        return {"session_id": None, "cwd": None, "gitBranch": None, "version": None}
+    hit = _CLAUDE_META.get(path)
+    if hit and (hit[0] == stamp or all(v is not None for v in hit[1].values())):
+        return hit[1]
+    info: dict[str, Any] = {"session_id": None, "cwd": None, "gitBranch": None, "version": None}
+    try:
+        with path.open("rb") as handle:
+            blob = handle.read(SNIFF_BYTES)
+    except OSError:
+        return info
+    for line in blob.decode("utf-8", "replace").split("\n"):
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        if info["session_id"] is None and record.get("sessionId"):
+            info["session_id"] = str(record["sessionId"])
+        for field in CLAUDE_META_FIELDS:
+            if info[field] is None and record.get(field):
+                info[field] = str(record[field])
+        if all(value is not None for value in info.values()):
+            break
+    _CLAUDE_META[path] = (stamp, info)
+    return info
+
+
+_HISTORY_CACHE: dict[Path, tuple[tuple[int, float], dict[str, str]]] = {}
+
+
+def claude_prompt_names(root: Path) -> dict[str, str]:
+    """session id → its first prompt, from <root>/../history.jsonl; cached until that file changes."""
+    history = root.parent / "history.jsonl"
+    try:
+        st = history.stat()
+    except OSError:
+        return {}
+    sig = (st.st_size, st.st_mtime)
+    hit = _HISTORY_CACHE.get(history)
+    if hit and hit[0] == sig:
+        return hit[1]
+    names: dict[str, str] = {}
+    try:
+        with history.open(encoding="utf-8", errors="replace") as handle:
+            for record in records(handle):
+                sid, display = record.get("sessionId"), record.get("display")
+                if isinstance(sid, str) and isinstance(display, str) and sid not in names:
+                    text = " ".join(display.split())
+                    if text and not text.startswith("/"):      # slash commands are not what a session is about
+                        names[sid] = text[:LABEL_LIMIT * 2]
+    except OSError:
+        return {}
+    _HISTORY_CACHE[history] = (sig, names)
+    return names
+
+
+def claude_discover(root: Path) -> list[SessionRef]:
+    """Mains and subagents under <root>/<project-slug>/; identity comes from the path, not contents."""
+    refs: list[SessionRef] = []
+    prompts = claude_prompt_names(root)
+    try:
+        slugs = [entry for entry in os.scandir(root) if entry.is_dir()]
+    except OSError:
+        return []
+    for slug in slugs:
+        try:
+            entries = list(os.scandir(slug.path))
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_file() and entry.name.endswith(".jsonl") and UUID_RE.match(Path(entry.name).stem):
+                if not _recent(entry.stat().st_mtime):
+                    continue
+                sid = Path(entry.name).stem
+                refs.append(SessionRef(
+                    fmt=FORMATS["claude"], path=Path(entry.path), kind="main", session_id=sid,
+                    parent_id=sid, agent_id=None, name=prompts.get(sid) or Path(slug.name).name[-20:] or sid[:8],
+                    role="session", cwd=claude_meta(Path(entry.path))["cwd"], mtime=entry.stat().st_mtime,
+                    source_key=source_key("claude", root, sid)))
+            elif entry.is_dir() and UUID_RE.match(entry.name):
+                refs.extend(_claude_subagents(root, Path(entry.path), entry.name))
+    return refs
+
+
+class RootSel(NamedTuple):
+    fmt_name: str
+    path: Path
+    enabled: bool
+
+
+def as_roots(root: Path | list[RootSel] | None) -> list[RootSel]:
+    """Normalizes follow()/mirror()'s root argument to a RootSel list for discovery_snapshot."""
+    if root is None:
+        return []
+    if isinstance(root, Path):
+        return [RootSel("codex", root, True)]
+    return list(root)
+
+
+def discovery_snapshot(roots: list[RootSel]) -> list[SessionRef]:
+    """The single shared scan behind the dashboard, follow(), mirrors, and the footer."""
+    refs: list[SessionRef] = []
+    for sel in roots:
+        if not sel.enabled:
+            continue
+        fmt = FORMATS.get(sel.fmt_name)
+        if fmt is None:
+            continue
+        with contextlib.suppress(OSError):
+            refs.extend(fmt.discover(sel.path))
+    mains = sorted((r for r in refs if r.kind == "main"), key=lambda r: r.mtime, reverse=True)
+    subs = sorted((r for r in refs if r.kind == "subagent"), key=lambda r: r.mtime, reverse=True)
+    return mains[:MAIN_LIMIT] + subs[:SUBAGENT_LIMIT]
+
+
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+CLAUDE_BOOKKEEPING = {"attachment", "mode", "permission-mode", "last-prompt", "ai-title",
+                      "queue-operation", "atis-latch"}
+CLAUDE_SKIP_STATE = CLAUDE_BOOKKEEPING | {"system"}
+
+
+def is_claude_bookkeeping(kind: Any) -> bool:
+    """The whole `file-history-*` family is bookkeeping (spec §3.5), not just two literals."""
+    return isinstance(kind, str) and (kind in CLAUDE_BOOKKEEPING or kind.startswith("file-history-"))
+
+
+CLAUDE_ERROR_STOP_REASONS = {"max_tokens", "refusal"}
+
+
+def _claude_blocks(record: dict[str, Any]) -> list[dict[str, Any]]:
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+
+
+LOCAL_COMMAND_MARKERS = ("<command-name>", "<local-command-stdout>", "<local-command-caveat>")
+
+
+def is_local_command(record: dict[str, Any]) -> bool:
+    """`/model`, `/exit` and their output are logged as user records but start no turn."""
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return claude_text(content).lstrip().startswith(LOCAL_COMMAND_MARKERS)
+
+
+def claude_advance(state: str, record: dict[str, Any]) -> str:
+    """Conservative observation of the transcript, never a lifecycle protocol."""
+    kind = record.get("type")
+    if kind == "system":
+        return STATE_DONE if record.get("subtype") == "turn_duration" else state
+    if is_claude_bookkeeping(kind) or record.get("__oversized__"):
+        return state
+    if record.get("isApiErrorMessage"):
+        return STATE_ERROR
+    if kind == "user":
+        if record.get("isMeta") or record.get("isCompactSummary") or is_local_command(record):
+            return state
+        return STATE_WORKING
+    if kind == "assistant":
+        message = record.get("message")
+        if not isinstance(message, dict):
+            return state
+        if any(b.get("type") == "tool_use" for b in _claude_blocks(record)):
+            return STATE_WORKING
+        if message.get("stop_reason") == "end_turn":
+            return STATE_DONE
+        if message.get("stop_reason") in CLAUDE_ERROR_STOP_REASONS:
+            return STATE_ERROR
+        return STATE_WORKING
+    return state
+
+
+def _claude_message_usage(state: dict[str, Any], record: dict[str, Any], message: dict[str, Any]) -> None:
+    usage, mid = message.get("usage"), message.get("id")
+    if not isinstance(usage, dict) or not isinstance(mid, str):
+        return
+    key = f"{record.get('sessionId', '')}:{mid}"       # ids are per API call; scope them per session anyway
+    saved = state.get("recent_ids")
+    recent = [m for m in saved if isinstance(m, str)] if isinstance(saved, list) else []
+    if key in recent:
+        return
+    state["recent_ids"] = (recent + [key])[-USAGE_ID_WINDOW:]
+    fresh, written = _as_int(usage.get("input_tokens")), _as_int(usage.get("cache_creation_input_tokens"))
+    read, out = _as_int(usage.get("cache_read_input_tokens")), _as_int(usage.get("output_tokens"))
+    details = usage.get("output_tokens_details")
+    thinking = _as_int(details.get("thinking_tokens")) if isinstance(details, dict) else 0
+    for key, amount in (("input", fresh), ("cache_write", written), ("cache_read", read),
+                        ("output", out), ("thinking", thinking), ("requests", 1)):
+        _add(state, key, amount)
+    state["last_context"] = fresh + written + read
+
+
+def claude_usage_feed(state: dict[str, Any], record: dict[str, Any]) -> None:
+    """Fold one Claude transcript record into the usage accumulator (see UsageCounter).
+
+    Claude writes one record per content block of the same API message, each repeating the
+    message's `usage`; the message id de-duplicates them so a message is counted once."""
+    kind = record.get("type")
+    message = record.get("message")
+    if kind not in {"assistant", "user"} or not isinstance(message, dict):
+        return
+    blocks = _claude_blocks(record)
+    if kind == "user":
+        _add(state, "tool_errors", sum(1 for b in blocks if b.get("type") == "tool_result" and b.get("is_error")))
+        return
+    _add(state, "tool_calls", sum(1 for b in blocks if b.get("type") == "tool_use"))
+    if message.get("model"):
+        state["model"] = str(message["model"])
+    effort = record.get("perTurnEffort") or record.get("effort")
+    if isinstance(effort, str) and effort:
+        state["effort"] = effort
+    _claude_message_usage(state, record, message)
+
+
+def scan_state(path: Path, fmt: Format) -> str:
+    """Backward, record-aligned scan: parse records, never substring-match markers."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return STATE_UNKNOWN
+    window = 0
+    while window < min(size, MAX_SCAN_BYTES):
+        window = min(size, MAX_SCAN_BYTES, max(SCAN_CHUNK, window * 2))
+        try:
+            with path.open("rb") as handle:
+                handle.seek(size - window)
+                if window < size:
+                    handle.readline()                 # align to the next record boundary
+                blob = handle.read()
+        except OSError:
+            return STATE_UNKNOWN
+        state = STATE_UNKNOWN
+        for record in records(blob.decode("utf-8", "replace").split("\n")):
+            state = fmt.advance(state, record)
+        if state != STATE_UNKNOWN:
+            return state
+    return STATE_UNKNOWN
+
+
+CLAUDE_FILE_TOOLS = {"Read", "Write", "Edit", "Grep", "Glob", "NotebookEdit"}
+CLAUDE_AGENT_TOOLS = {"Agent", "Task", "SendMessage", "ListAgents"}
+CLAUDE_PLAN_TOOLS = {"TodoWrite", "ExitPlanMode"}
+CLAUDE_SKIP_SUBTYPES = {"stop_hook_summary", "informational", "away_summary",
+                        "local_command", "permission_retry"}
+COMMAND_RE = re.compile(r"<command-name>(.*?)</command-name>(?:.*?<command-args>(.*?)</command-args>)?",
+                        re.S)
+STDOUT_RE = re.compile(r"<local-command-stdout>(.*?)</local-command-stdout>", re.S)
+
+
+def claude_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = [str(b.get("text", "")) for b in content
+             if isinstance(b, dict) and b.get("type") == "text"]
+    return "\n".join(p for p in parts if p)
+
+
+def claude_result_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return json.dumps(content, ensure_ascii=False) if content else ""
+    chunks = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "image":
+            chunks.append("⟦image⟧")
+        elif item.get("text"):
+            chunks.append(str(item["text"]))
+    return "\n".join(chunks)
+
+
+def render_claude_tool_use(stamp: str, blk: dict[str, Any]) -> str | None:
+    name = str(blk.get("name", "tool"))
+    args = redact(blk.get("input") if isinstance(blk.get("input"), dict) else {})
+    if name == "Bash":
+        body = "$ " + clean(str(args.get("command", "")))
+        if args.get("description"):
+            body += "\n" + STYLE.paint("90", str(args["description"]))
+        return block(stamp, "33", "⚙ EXEC ⇢", body)
+    if name in CLAUDE_PLAN_TOOLS:
+        steps = [{"step": t.get("content", ""), "status": t.get("status", "pending")}
+                 for t in args.get("todos") or [] if isinstance(t, dict)]
+        return block(stamp, "34", "📋 PLAN", plan_lines({"plan": steps}) if steps else kv_lines(args))
+    if name in CLAUDE_AGENT_TOOLS:
+        body = "\n".join(filter(None, [
+            clean(str(args.get("description", "")), 200),
+            clean(str(args.get("prompt", args.get("message", ""))), 400)]))
+        return block(stamp, "95", f"👥 AGENT ⇢ {args.get('subagent_type', name)}", body)
+    if name.startswith("mcp__"):
+        bits = name.split("__")
+        label = f"{bits[1]}/{'__'.join(bits[2:])}" if len(bits) > 2 else name
+        return block(stamp, "33", f"⚙ MCP ⇢ {label}", kv_lines(args))
+    if name in CLAUDE_FILE_TOOLS:
+        target = args.get("file_path") or args.get("path") or args.get("pattern") or ""
+        body = clean(str(target), 300)
+        if name == "Edit":
+            body += ("\n" + STYLE.paint("31", "-" + clean(str(args.get("old_string", "")), 200))
+                     + "\n" + STYLE.paint("32", "+" + clean(str(args.get("new_string", "")), 200)))
+        return block(stamp, "33", f"⚙ TOOL ⇢ {name}", body)
+    return block(stamp, "33", f"⚙ TOOL ⇢ {name}", kv_lines(args) if args else "")
+
+
+def claude_render(record: dict[str, Any], opts: dict[str, Any]) -> str | None:
+    if record.get("__oversized__"):
+        return block("", "90", "⟦oversized⟧", f"oversized record: {record['__oversized__']} bytes, skipped")
+    kind = record.get("type")
+    stamp = str(record.get("timestamp", ""))[:19].replace("T", " ")
+    if is_claude_bookkeeping(kind):
+        return None
+    if kind == "system":
+        subtype = record.get("subtype")
+        if subtype == "compact_boundary":
+            return block(stamp, "90", "⟲ COMPACTED", "context compacted")
+        if subtype == "turn_duration":
+            ms = record.get("durationMs")
+            return block(stamp, "32", "✔ DONE", STYLE.paint("90", f"turn took {int(ms) / 1000:.1f}s")
+                         if isinstance(ms, (int, float)) else "turn complete")
+        return None
+    message = record.get("message")
+    message = message if isinstance(message, dict) else {}
+    if record.get("isApiErrorMessage"):
+        return block(stamp, "31", "✘ ERROR", clean(claude_text(message.get("content"))))
+    if not isinstance(record.get("message"), dict):
+        return None
+    if kind == "user":
+        if record.get("isMeta"):
+            return None
+        if record.get("isCompactSummary"):
+            return block(stamp, "90", "⟲ COMPACTED", prose(clean(claude_text(message.get("content")))))
+        content = message.get("content")
+        blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+        results = [b for b in blocks if b.get("type") == "tool_result"]
+        if results:
+            rendered = [block(stamp, "31" if r.get("is_error") else "33",
+                              "✘ TOOL ⇠" if r.get("is_error") else "⚙ TOOL ⇠",
+                              clean(claude_result_text(r.get("content")))) for r in results]
+            return "".join(rendered)
+        text = claude_text(content)
+        command = COMMAND_RE.search(text)
+        if command:
+            args = (command.group(2) or "").strip()
+            return block(stamp, "90", "⌘ COMMAND", clean(f"{command.group(1)} {args}".strip(), 200))
+        stdout = STDOUT_RE.search(text)
+        if stdout:
+            return block(stamp, "90", "⌘ OUTPUT", clean(stdout.group(1).strip(), 300))
+        return block(stamp, "35", "❯ YOU", prose(clean(text))) if text.strip() else None
+    if kind == "assistant":
+        out = []
+        for blk in _claude_blocks(record):
+            btype = blk.get("type")
+            if btype == "text" and str(blk.get("text", "")).strip():
+                out.append(block(stamp, "33", "✦ CLAUDE", prose(clean(str(blk["text"])))))
+            elif btype == "thinking" and opts.get("thinking", True):
+                out.append(block(stamp, "90", "💭 THINKING", clean(str(blk.get("thinking", "")))))
+            elif btype == "tool_use":
+                rendered = render_claude_tool_use(stamp, blk)
+                if rendered:
+                    out.append(rendered)
+        return "".join(out) or None
+    return None
+
+
+CLAUDE = Format("claude", "CL", claude_discover, claude_meta, claude_render,
+                claude_advance, lambda p: scan_state(p, CLAUDE), dedupe=False,
+                usage_feed=claude_usage_feed)
+FORMATS: dict[str, Format] = {"codex": CODEX, "claude": CLAUDE}
+
+
+def _path_signature(path: Path) -> str | None:
+    parts = path.parts
+    if path.name.startswith("rollout-") and path.suffix == ".jsonl":
+        return "codex"
+    if path.parent.name == "subagents" and path.name.startswith("agent-"):
+        return "claude"
+    if UUID_RE.match(path.stem) and "projects" in parts:
+        return "claude"
+    return None
+
+
+def detect_format(path: Path) -> Format | None:
+    """Positive signatures only: None means 'not yet decidable', never 'assume Codex'."""
+    signature = _path_signature(path)
+    if signature:
+        return FORMATS[signature]
+    try:
+        with path.open("rb") as handle:
+            blob = handle.read(SNIFF_BYTES)
+    except OSError:
+        return None
+    for line in blob.decode("utf-8", "replace").split("\n")[:SNIFF_RECORDS]:
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        if isinstance(record.get("payload"), dict) or record.get("type") == "session_meta":
+            return CODEX
+        if record.get("sessionId") and (isinstance(record.get("message"), dict)
+                                        or is_claude_bookkeeping(record.get("type"))):
+            return FORMATS["claude"]
+    return None
+
+
+def detect_root_format(root: Path) -> Format | None:
+    if any((root / name).is_dir() for name in ("projects",)) or root.name == "projects":
+        return FORMATS["claude"]
+    if _day_dirs(root) or any(root.rglob("rollout-*.jsonl")):
+        return CODEX
+    for candidate in list(root.rglob("*.jsonl"))[:20]:
+        found = detect_format(candidate)
+        if found:
+            return found
+    return None
+
+
+# ── Codex root discovery & settings ─────────────────────────────────────────
+
+class RootInfo(NamedTuple):
+    fmt_name: str
+    path: Path
+    count: int
+    newest: float
+
+
+def _children(directory: Path) -> list[Path]:
+    try:
+        return sorted(p for p in directory.iterdir() if p.is_dir())
+    except OSError:
+        return []
+
+
+def candidate_roots(home: Path | None = None, env: Any = None, mnt: Path = Path("/mnt"),
+                    home_parent: Path | None = None) -> list[Path]:
+    """Every place a Codex `sessions` dir could live on this box, existing ones only."""
+    home = home or Path.home()
+    env = os.environ if env is None else env
+    found: list[Path] = []
+    if env.get("CODEX_HOME"):
+        found.append(Path(env["CODEX_HOME"]) / "sessions")
+    found.append(home / ".codex" / "sessions")
+    if env.get("USERPROFILE"):  # native Windows
+        found.append(Path(env["USERPROFILE"]) / ".codex" / "sessions")
+    for drive in _children(mnt):  # WSL → Windows profiles on every mounted drive
+        for user in _children(drive / "Users"):
+            found.append(user / ".codex" / "sessions")
+    parents = [home_parent or home.parent, Path("/home"), Path("/Users")]
+    for parent in dict.fromkeys(parents):  # other local users
+        for user in _children(parent):
+            found.append(user / ".codex" / "sessions")
+    unique = dict.fromkeys(p for p in found if p.is_dir())
+    return list(unique)
+
+
+def claude_candidate_roots(home: Path | None = None, env: Any = None, mnt: Path = Path("/mnt"),
+                           home_parent: Path | None = None) -> list[Path]:
+    """Every place a Claude Code `projects` dir could live on this box, existing ones only."""
+    home = home or Path.home()
+    env = os.environ if env is None else env
+    found: list[Path] = []
+    if env.get("CLAUDE_CONFIG_DIR"):
+        found.append(Path(env["CLAUDE_CONFIG_DIR"]) / "projects")
+    found.append(home / ".claude" / "projects")
+    for drive in _children(mnt):  # WSL → Windows profiles on every mounted drive
+        for user in _children(drive / "Users"):
+            found.append(user / ".claude" / "projects")
+    for parent in dict.fromkeys([home_parent or home.parent, Path("/home"), Path("/Users")]):
+        for user in _children(parent):
+            found.append(user / ".claude" / "projects")
+    return list(dict.fromkeys(p for p in found if p.is_dir()))
+
+
+def discover_roots(candidates: Iterable[Path]) -> list[RootInfo]:
+    """Rank candidate Codex roots by their most recently active rollout; drop empty ones."""
+    infos: list[RootInfo] = []
+    for root in dict.fromkeys(candidates):
+        stamps = [m for p in recent_rollouts(root) if (m := _mtime(p)) is not None]
+        if stamps:
+            infos.append(RootInfo("codex", root, len(stamps), max(stamps)))
+    return sorted(infos, key=lambda info: info.newest, reverse=True)
+
+
+def discover_all_roots() -> list[RootInfo]:
+    infos: list[RootInfo] = []
+    for fmt_name, candidates in (("codex", candidate_roots()), ("claude", claude_candidate_roots())):
+        fmt = FORMATS[fmt_name]
+        for root in dict.fromkeys(candidates):
+            with contextlib.suppress(OSError):
+                refs = fmt.discover(root)
+                if refs:
+                    infos.append(RootInfo(fmt_name, root, len(refs), max(r.mtime for r in refs)))
+    return sorted(infos, key=lambda info: info.newest, reverse=True)
+
+
+CONFIG_VERSION = 2
+
+
+def load_roots(config: dict[str, Any]) -> list[RootSel] | None:
+    """None = nothing stored (use discovery); [] = an intentional empty selection."""
+    raw = config.get("roots")
+    if isinstance(raw, list):
+        out = []
+        for item in raw:
+            if not isinstance(item, dict) or not item.get("path"):
+                continue
+            fmt_name = str(item.get("format", "codex"))
+            if fmt_name not in FORMATS:
+                continue
+            out.append(RootSel(fmt_name, Path(str(item["path"])), bool(item.get("enabled", True))))
+        return out
+    saved = config.get("root")
+    if isinstance(saved, str) and saved:
+        return [RootSel("codex", Path(saved), True)]
+    return None
+
+
+def roots_payload(roots: list[RootSel]) -> dict[str, Any]:
+    return {"v": CONFIG_VERSION,
+            "roots": [{"format": r.fmt_name, "path": str(r.path), "enabled": r.enabled} for r in roots]}
+
+
+def merge_root_choices(saved: list[RootSel], discovered: list[RootInfo]) -> list[RootSel]:
+    out = list(saved)
+    known = {(sel.fmt_name, sel.path.resolve() if sel.path.exists() else sel.path) for sel in saved}
+    for info in discovered:
+        key = (info.fmt_name, info.path.resolve() if info.path.exists() else info.path)
+        if key not in known:
+            out.append(RootSel(info.fmt_name, info.path, False))   # never auto-enable
+    return out
+
+
+def resolve_roots(cli_root: Path | None, cli_format: str | None, config: dict[str, Any],
+                  discovered: list[RootSel]) -> list[RootSel]:
+    if cli_root is not None:
+        fmt = FORMATS[cli_format] if cli_format else detect_root_format(cli_root)
+        return [RootSel((fmt or CODEX).name, cli_root, True)]
+    stored = load_roots(config)
+    if stored is not None:
+        return stored
+    return discovered
+
+
+def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_config(path: Path, data: dict[str, Any]) -> str | None:
+    """Returns None on success, or a short error string the caller can show."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        return f"config save failed: {exc.strerror or exc}"
+    return None
+
+
+def resolve_root(cli_root: Path | None, config: dict[str, Any],
+                 discovered: list[RootInfo]) -> Path | None:
+    """Compatibility wrapper: first enabled root's path, honoring the old on-disk fallback."""
+    if cli_root is not None:
+        return cli_root
+    stored = load_roots(config)
+    if stored:
+        first = stored[0]
+        if first.enabled and first.path.is_dir():
+            return first.path
+    return discovered[0].path if discovered else None
+
+
+def ago(stamp: float) -> str:
+    delta = max(0, int(time.time() - stamp))
+    if delta < 90:
+        return f"{delta}s ago"
+    if delta < 5400:
+        return f"{delta // 60}m ago"
+    if delta < 172800:
+        return f"{delta // 3600}h ago"
+    return f"{delta // 86400}d ago"
+
+
+# ── incremental NDJSON tailing ──────────────────────────────────────────────
+
+class TailRead(NamedTuple):
+    truncated: bool
+    records: list[dict[str, Any]]
+    more_pending: bool
+
+
+class NdjsonTail:
+    """Reads only newly appended bytes of a rollout; survives multibyte splits and truncation."""
+
+    def __init__(self, path: Path, offset: int = 0):
+        self.path = path
+        self.offset = offset
+        self.committed = offset
+        self.backfill_from = 0     # bytes [0, backfill_from) were skipped by a backfill
+        self.partial = ""
+        self._partial_bytes = 0
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def reset(self, offset: int = 0) -> None:
+        self.offset = offset
+        self.committed = offset
+        self.backfill_from = 0
+        self.partial = ""
+        self._partial_bytes = 0
+        self._decoder.reset()
+
+    def read(self, backfill: int | None = None, max_bytes: int = READ_CHUNK_BYTES) -> TailRead:
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            return TailRead(False, [], False)
+        truncated = size < self.offset
+        if truncated:
+            self.reset()
+        if size == self.offset:
+            return TailRead(truncated, [], False)
+        try:
+            with self.path.open("rb") as handle:
+                if self.offset == 0 and backfill and size > backfill:
+                    start = size - backfill
+                    handle.seek(start)
+                    handle.readline()          # discard the partial record at the seek point
+                    if handle.tell() >= size:  # the window held no record boundary
+                        window = min(MAX_RECORD_BYTES, size)
+                        handle.seek(size - window)
+                        if window < size:
+                            handle.readline()
+                    self.offset = self.committed = self.backfill_from = handle.tell()
+                else:
+                    handle.seek(self.offset)
+                read_start = self.offset
+                chunk = handle.read(max_bytes)
+                self.offset = handle.tell()
+        except OSError:
+            return TailRead(truncated, [], False)
+        pieces = (self.partial + self._decoder.decode(chunk)).split("\n")
+        self.partial = pieces.pop()
+        self._partial_bytes = len(self.partial.encode("utf-8", "replace"))
+        # Derive the safe commit boundary from the RAW bytes actually read, not from the decoded
+        # `partial` string: the incremental decoder can silently buffer a dangling, not-yet-complete
+        # multi-byte sequence internally (invisible in `partial`) while `offset` already advanced past
+        # it. Using the last newline in the raw chunk keeps `committed` from ever landing mid-record.
+        nl_index = chunk.rfind(b"\n")
+        if nl_index != -1:
+            self.committed = read_start + nl_index + 1
+        out: list[dict[str, Any]] = []
+        if pieces:
+            # the first piece may carry an in-flight record accumulated across earlier reads;
+            # check it before parsing, since it could complete oversized in the same pass that
+            # pushed it past the limit rather than lingering as `self.partial`.
+            first_bytes = len(pieces[0].encode("utf-8", "replace"))
+            if first_bytes > MAX_RECORD_BYTES:
+                out.append({"__oversized__": first_bytes})
+                pieces = pieces[1:]
+        out.extend(records(pieces))
+        if self._partial_bytes > MAX_RECORD_BYTES:      # a single record too big to hold
+            out.append({"__oversized__": self._partial_bytes})
+            self._drop_partial()
+        return TailRead(truncated, out, self.offset < size)
+
+    def _drop_partial(self) -> None:
+        """Abandon an oversized in-progress record: skip to its terminating newline."""
+        try:
+            with self.path.open("rb") as handle:
+                handle.seek(self.offset)
+                while True:
+                    chunk = handle.read(READ_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    nl = chunk.find(b"\n")
+                    if nl >= 0:
+                        self.offset = self.offset + nl + 1
+                        break
+                    self.offset += len(chunk)
+        except OSError:
+            pass
+        self.partial = ""
+        self._partial_bytes = 0
+        self.committed = self.offset
+        self._decoder.reset()
+
+
+class TranscriptCache:
+    """Tails one NDJSON file: keeps rendered ANSI lines and a width-keyed word-wrap cache."""
+
+    def __init__(self, source: Path | SessionRef):
+        self.ref = as_ref(source)
+        self.path = self.ref.path
+        self.tail = NdjsonTail(self.ref.path)
+        self.lines: list[str] = []
+        self.state = STATE_UNKNOWN
+        self.error: str | None = None
+        self.dedupe = Deduper()
+        self.counter = UsageCounter(self.ref.fmt)
+        self._scanned = False
+        self._wkey: tuple[int, bool] | None = None
+        self._wrapped: list[str] = []
+        self._wsrc = 0
+
+    def reset(self) -> None:
+        self.tail.reset()
+        self.lines.clear()
+        self.state = STATE_UNKNOWN
+        self.dedupe = Deduper()
+        self.counter = UsageCounter(self.ref.fmt)
+        self._scanned = False
+        self._wkey = None
+
+    @property
+    def usage(self) -> Usage:
+        return self.counter.snapshot()
+
+    def update(self) -> bool:
+        try:
+            result = self.tail.read(backfill=BACKFILL_BYTES)
+        except OSError as exc:
+            self.error = f"read failed: {exc.strerror or exc}"
+            return False
+        self.error = None
+        truncated, new_records = result.truncated, result.records
+        if truncated:
+            self.lines.clear()
+            self.state = STATE_UNKNOWN
+            self.dedupe = Deduper()
+            self.counter = UsageCounter(self.ref.fmt)
+            self._scanned = False
+            self._wkey = None
+        changed = truncated
+        prior_state, prior_usage = self.state, self.counter.snapshot()
+        fmt = self.ref.fmt
+        if not self._scanned and self.tail.backfill_from:
+            usage_scan(self.counter, self.path, self.tail.backfill_from)
+        if self.tail.offset > 0:          # a backfill can only still happen while nothing was read
+            self._scanned = True
+        for record in new_records:
+            self.state = fmt.advance(self.state, record)
+            self.counter.feed(record)
+            rendered = fmt.render(record, DISPLAY_OPTS)
+            if not rendered or (fmt.dedupe and not self.dedupe.fresh(rendered)):
+                continue
+            for line in rendered.rstrip("\n").splitlines():
+                self.lines.append(CTRL_RE.sub(" ", line))
+            self.lines.append("")  # breathing room between blocks
+            changed = True
+        if self.state != prior_state or self.counter.snapshot() != prior_usage:
+            changed = True
+        if len(self.lines) > MAX_CACHED_LINES:
+            del self.lines[: len(self.lines) - MAX_CACHED_LINES]
+            self._wkey = None
+        return changed
+
+    def wrapped(self, width: int, wrap_on: bool) -> list[str]:
+        key = (width, wrap_on)
+        if key != self._wkey:
+            self._wkey = key
+            self._wrapped = []
+            self._wsrc = 0
+        while self._wsrc < len(self.lines):
+            line = self.lines[self._wsrc]
+            if wrap_on:
+                self._wrapped.extend(wrap_ansi(line, width))
+            else:
+                self._wrapped.append(line)
+            self._wsrc += 1
+        return self._wrapped
+
+
+def with_freshness(state: str, mtime: float, now: float, window: float = DEFAULT_ACTIVE_WINDOW_SECS) -> str:
+    """A 'working' session nobody wrote to for `window` seconds is stale, not live."""
+    return STATE_STALE if state == STATE_WORKING and now - mtime > window else state
+
+
+def session_state(ref: SessionRef, now: float, window: float = DEFAULT_ACTIVE_WINDOW_SECS) -> str:
+    """The format's own status source when it has one, else the transcript scan; then freshness.
+    `now` is wall-clock time, to compare with the file's mtime."""
+    state = ref.fmt.status(ref) if ref.fmt.status is not None else None
+    if state is None:
+        state = ref.fmt.scan_state(ref.path)
+    mtime = _mtime(ref.path)
+    return with_freshness(state, mtime, now, window) if mtime is not None else state
+
+
+def is_active(ref: SessionRef, state: str, now: float, window: float) -> bool:
+    return state in (STATE_WORKING, STATE_STALE) or now - ref.mtime <= window
+
+
+def filter_active(refs: list[SessionRef], states: dict[Path, str], now: float,
+                  window: float = DEFAULT_ACTIVE_WINDOW_SECS) -> list[SessionRef]:
+    """Display-only: sessions still working, or written to within the window."""
+    return [r for r in refs if is_active(r, states.get(r.path, STATE_UNKNOWN), now, window)]
+
+
+DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smh]?)\s*$")
+
+
+def parse_duration(text: str) -> float:
+    """'90' → 90s, '30m' → 1800s, '1.5h' → 5400s."""
+    match = DURATION_RE.match(text)
+    if not match:
+        raise ValueError(f"not a duration: {text!r} (use seconds, or a number followed by s/m/h)")
+    return float(match.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[match.group(2)]
+
+
+def refresh_states(refs: list[SessionRef], caches: dict[Path, TranscriptCache],
+                   states: dict[Path, str], now: float,
+                   checked: dict[Path, tuple[float, float]],
+                   window: float = DEFAULT_ACTIVE_WINDOW_SECS) -> bool:
+    """Keep every displayed row's status current without rendering it."""
+    changed = False
+    wall = time.time()
+    for ref in refs:
+        try:
+            mtime = ref.path.stat().st_mtime
+        except OSError:
+            continue
+        cached = caches.get(ref.path)
+        if cached is not None:
+            state = ref.fmt.status(ref) if ref.fmt.status is not None else None
+            state = with_freshness(state or cached.state, mtime, wall, window)
+            if states.get(ref.path) != state:
+                states[ref.path] = state
+                changed = True
+            continue
+        seen = checked.get(ref.path)
+        if seen and now - seen[0] < BG_UPDATE_SECS and mtime == seen[1]:
+            continue
+        checked[ref.path] = (now, mtime)
+        state = session_state(ref, wall, window)
+        if states.get(ref.path) != state:
+            states[ref.path] = state
+            changed = True
+    return changed
+
+
+# ── token usage ─────────────────────────────────────────────────────────────
+
+class Usage(NamedTuple):
+    """One session's cumulative token accounting, normalized across Codex and Claude.
+
+    `input` is fresh (uncached) input; `thinking` is the part of `output` spent reasoning."""
+    input: int
+    cache_read: int
+    cache_write: int
+    output: int
+    thinking: int
+    requests: int          # model round-trips: Codex token_count events / distinct Claude message ids
+    tool_calls: int
+    tool_errors: int
+    last_context: int      # input size of the most recent request: the live context footprint
+    context_window: int | None
+    model: str | None
+    effort: str | None     # reasoning effort of the most recent request (low/medium/high/xhigh)
+
+    @property
+    def total(self) -> int:
+        return self.input + self.cache_read + self.cache_write + self.output
+
+    @classmethod
+    def empty(cls) -> Usage:
+        return cls(0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None)
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> Usage:
+        window = state.get("context_window")
+        return cls(*(max(0, _as_int(state.get(key))) for key in USAGE_KEYS),
+                   context_window=window if _as_int(window) > 0 else None,
+                   model=safe_label(state.get("model")), effort=safe_label(state.get("effort")))
+
+
+def safe_label(value: Any) -> str | None:
+    """A model/effort name from an untrusted transcript or ledger: escapes stripped, one line, bounded."""
+    if not isinstance(value, str):
+        return None
+    text = " ".join(CTRL_RE.sub("", clean(value, LABEL_LIMIT * 4)).split())
+    return text[:LABEL_LIMIT] or None
+
+
+class UsageCounter:
+    """Accumulates a session's Usage record by record.
+
+    The accumulator is a JSON-serializable dict so a checkpoint can carry it across restarts
+    (`state()` / `restore()`). Feeding is exact, not idempotent: callers feed every record once,
+    which is why the tailing readers scan the bytes a backfill skipped (`usage_scan`)."""
+
+    def __init__(self, fmt: Format, state: dict[str, Any] | None = None):
+        self.fmt = fmt
+        self._state: dict[str, Any] = dict(state) if state else {}
+
+    @classmethod
+    def restore(cls, fmt: Format, state: Any) -> UsageCounter:
+        return cls(fmt, state if isinstance(state, dict) else None)
+
+    def feed(self, record: dict[str, Any]) -> None:
+        if record.get("__oversized__"):
+            return
+        self.fmt.usage_feed(self._state, record)
+
+    def state(self) -> dict[str, Any]:
+        return dict(self._state)
+
+    def snapshot(self) -> Usage:
+        return Usage.from_state(self._state)
+
+
+def usage_scan(counter: UsageCounter, path: Path, end: int) -> None:
+    """Feed the records in bytes [0, end) of `path`: the region a backfilled tail skipped."""
+    tail = NdjsonTail(path)
+    while tail.offset < end:
+        result = tail.read(max_bytes=min(READ_CHUNK_BYTES, end - tail.offset))
+        for record in result.records:
+            counter.feed(record)
+        if not result.records and not result.more_pending:
+            break
+
+
+def format_tokens(count: int) -> str:
+    if count >= 999_500:
+        return f"{count / 1_000_000:.1f}M"
+    if count >= 1000:
+        return f"{count // 1000}k"
+    return str(count)
+
+
+MODEL_CELL_WIDTH = 22
+
+
+def model_cell(usage: Usage | None) -> str:
+    """Agent-list cell: `model/effort`, truncating the model so the effort always survives."""
+    if usage is None or not usage.model:
+        return "·"
+    if not usage.effort:
+        return usage.model[:MODEL_CELL_WIDTH]
+    room = max(4, MODEL_CELL_WIDTH - len(usage.effort) - 1)
+    return f"{usage.model[:room]}/{usage.effort}"
+
+
+def model_line(usage: Usage) -> str:
+    """`⚙ model · effort` for the most recent request; empty until a model was seen."""
+    if not usage.model:
+        return ""
+    return f"⚙ {usage.model}" + (f" · {usage.effort}" if usage.effort else "")
+
+
+def usage_line(usage: Usage) -> str:
+    """Compact, colorless summary for footers and stdout; empty until something was counted."""
+    if usage.requests == 0 and usage.total == 0:
+        return ""
+    context = usage.input + usage.cache_read + usage.cache_write
+    share = f" ⇄{usage.cache_read * 100 // context}%" if context else ""
+    bits = [f"↑{format_tokens(context)}{share} ↓{format_tokens(usage.output)}",
+            f"{usage.requests} req", f"{usage.tool_calls} tools"]
+    if usage.tool_errors:
+        bits.append(f"{usage.tool_errors}✘")
+    if usage.last_context:
+        window = f"/{format_tokens(usage.context_window)}" if usage.context_window else ""
+        bits.append(f"ctx {format_tokens(usage.last_context)}{window}")
+    return " · ".join(bits)
+
+
+class Ledger:
+    """One JSON file per observed session under `ledger_dir`, rewritten atomically on change.
+
+    Per-session files rather than one appended JSONL because a session keeps growing while it
+    is watched: overwriting its own file is idempotent and never rewrites shared state.
+    `jq -s . ledger/*.json` yields the cross-session table."""
+
+    def __init__(self, ledger_dir: Path):
+        self.dir = ledger_dir
+        self.entries: dict[str, Usage] = self._preload()
+
+    def _preload(self) -> dict[str, Usage]:
+        """Totals from earlier runs, so the agent list can show sessions not opened yet."""
+        entries: dict[str, Usage] = {}
+        try:
+            files = sorted(self.dir.glob("*.json"))
+        except OSError:
+            return entries
+        for file in files:
+            try:
+                data = json.loads(file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("v") == LEDGER_VERSION:
+                entries[file.stem] = Usage.from_state(data)
+        return entries
+
+    def known(self, source_key: str) -> Usage | None:
+        return self.entries.get(source_key)
+
+    def record(self, ref: SessionRef, usage: Usage) -> bool:
+        """Persist `usage` for `ref`; False when nothing changed since the last write."""
+        if self.entries.get(ref.source_key) == usage:
+            return False
+        path = _contained_path(self.dir, f"{ref.source_key}.json")
+        meta = ref.fmt.meta(ref.path) or {}
+        entry = {"v": LEDGER_VERSION, "format": ref.fmt.name,
+                 "session_id": str(meta.get("id") or ref.session_id), "agent_id": ref.agent_id,
+                 "kind": ref.kind, "name": ref.name, "role": ref.role, "cwd": ref.cwd or meta.get("cwd"),
+                 "transcript": str(ref.path), "updated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                 **usage._asdict(), "total": usage.total}
+        self.dir.mkdir(parents=True, exist_ok=True)
+        # A fresh exclusive temp file: never follows a planted symlink, never shared between two
+        # watchers of the same session; fsync so the rename publishes complete bytes.
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.stem}.", suffix=".tmp", dir=self.dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, indent=2) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+            raise
+        self.entries[ref.source_key] = usage
+        return True
+
+
+# ── human-readable text logs (tail -F friendly) ────────────────────────────
+
+CHECKPOINT_VERSION = 2
+
+
+def _contained_path(log_dir: Path, name: str) -> Path:
+    """`log_dir / name`, refusing any name that would resolve outside `log_dir`.
+
+    Defense in depth: `name` is normally already sanitized (`source_key`), but a malicious or
+    malformed `source_key`/`log_name` must never be trusted to stay inside the log directory.
+    """
+    candidate = (log_dir / name).resolve()
+    base = log_dir.resolve()
+    if candidate != base and base not in candidate.parents:
+        raise OSError(f"refusing to write log outside {base}: {name!r}")
+    return candidate
+
+
+class TextLog:
+    """Plain-text mirror of one transcript: `<log_dir>/<name>.log`, resumable."""
+
+    def __init__(self, log_dir: Path, source: Path | SessionRef,
+                 log_name: str | None = None, render_opts: dict[str, Any] | None = None):
+        self.ref = as_ref(source)
+        self.render_opts = render_opts or MIRROR_OPTS
+        ref = self.ref
+        if log_name is not None:
+            stem = log_name
+        elif ref.fmt is CODEX and ref.kind == "main" and (log_dir / f"{ref.path.stem}.log").exists():
+            stem = ref.path.stem                  # pre-existing Codex log: keep its name working
+        else:
+            stem = ref.source_key                 # new log: collision-free identity (spec §2.3)
+        self.log_dir = log_dir
+        self.path = _contained_path(log_dir, f"{stem}.log")
+        self.offset_path = _contained_path(log_dir, f".{stem}.offset")
+        offset, usage_state = self._resume()
+        self.tail = NdjsonTail(ref.path, offset=offset)
+        self.dedupe = Deduper()
+        self.counter = UsageCounter.restore(ref.fmt, usage_state)
+        if usage_state is None and offset > 0:      # checkpoint predates usage: count what it skipped
+            usage_scan(self.counter, ref.path, offset)
+        self._fresh = offset == 0
+
+    @property
+    def usage(self) -> Usage:
+        return self.counter.snapshot()
+
+    @property
+    def fresh(self) -> bool:
+        """True until the first sync writes (or rewrites) the log from byte 0."""
+        return self._fresh
+
+    def _resume(self) -> tuple[int, dict[str, Any] | None]:
+        """(offset, usage accumulator) from the checkpoint, or (0, None) to rebuild."""
+        if not self.path.is_file():
+            return 0, None
+        try:
+            raw = self.offset_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return 0, None
+        try:
+            saved = json.loads(raw)
+        except ValueError:
+            try:
+                return int(raw), None      # legacy v1: a bare integer, always Codex
+            except ValueError:
+                return 0, None
+        if not isinstance(saved, dict):
+            return 0, None
+        if saved.get("format", "codex") != self.ref.fmt.name or saved.get("render", {}) != self.render_opts:
+            return 0, None                 # options changed → rebuild rather than append inconsistently
+        saved_key = saved.get("key")
+        if saved_key is not None and saved_key != self.ref.source_key:
+            return 0, None                 # checkpoint belongs to a different source → rebuild
+        try:
+            offset = int(saved.get("offset", 0))
+        except (TypeError, ValueError):
+            return 0, None
+        usage_state = saved.get("usage")
+        return offset, usage_state if isinstance(usage_state, dict) else None
+
+    def _save_offset(self) -> None:
+        payload = {"v": CHECKPOINT_VERSION, "offset": self.tail.committed,
+                   "format": self.ref.fmt.name, "render": self.render_opts, "key": self.ref.source_key,
+                   "usage": self.counter.state()}
+        self.offset_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def _header(self) -> str:
+        meta = self.ref.fmt.meta(self.ref.path) or {}
+        bits = [f"session {meta.get('id', self.ref.path.stem)}"]
+        identity = subagent_identity(meta) if meta else None
+        if identity:
+            bits.append(f"subagent {identity[0]} ({identity[1]})")
+        if meta.get("cwd"):
+            bits.append(f"cwd {meta['cwd']}")
+        bits.append(str(self.ref.path))
+        return "═══ " + " · ".join(bits) + " ═══\n\n"
+
+    def sync(self, drain: bool = False) -> bool:
+        """Sync one bounded tail-read pass, or (with `drain=True`) loop until nothing is
+        pending. Live polling passes drain=False: the bound exists so one huge file can't starve
+        the others, and the next poll continues where this one left off. One-shot callers
+        (`--once`) pass drain=True so a transcript larger than READ_CHUNK_BYTES isn't silently
+        truncated by an exit that never comes back to finish the read."""
+        wrote = False
+        last_offset = -1
+        while True:
+            result = self.tail.read()
+            rebuild = result.truncated or self._fresh
+            if result.truncated:
+                self.counter = UsageCounter(self.ref.fmt)
+            for record in result.records:
+                self.counter.feed(record)
+            if rebuild or result.records:
+                _contained_path(self.log_dir, self.path.name)     # re-verify before mkdir/write
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("w" if rebuild else "a", encoding="utf-8") as handle:
+                    if rebuild:
+                        handle.write(self._header())
+                        wrote = True
+                    for record in result.records:
+                        rendered = self.ref.fmt.render(record, self.render_opts)
+                        if rendered and (not self.ref.fmt.dedupe or self.dedupe.fresh(rendered)):
+                            handle.write(CTRL_RE.sub(" ", strip_ansi(rendered)) + "\n")
+                            wrote = True
+                self._save_offset()
+                self._fresh = False
+            if not drain or not result.more_pending:
+                break
+            if self.tail.offset <= last_offset:     # no forward progress (e.g. truncated mid-drain)
+                break
+            last_offset = self.tail.offset
+        return wrote
+
+
+def point_latest(log_dir: Path, target: Path) -> None:
+    """Atomically repoint <log_dir>/latest.log at `target`."""
+    link = log_dir / LATEST_LOG
+    try:
+        if link.is_symlink() and os.readlink(link) == target.name:
+            return
+        tmp = log_dir / f".{LATEST_LOG}.tmp"
+        if tmp.exists() or tmp.is_symlink():
+            tmp.unlink()
+        tmp.symlink_to(target.name)
+        os.replace(tmp, link)
+    except OSError:
+        pass
+
+
+class MirrorSet:
+    """Keeps a TextLog per discovered session and `latest.log` on the newest main one."""
+
+    def __init__(self, log_dir: Path, ledger: Ledger | None = None):
+        self.log_dir = log_dir
+        self.ledger = ledger
+        self.logs: dict[Path, TextLog] = {}
+        self.errors: dict[Path, str] = {}
+
+    def sync(self, sessions: list[SessionRef] | list[tuple[str, str, Path]],
+             drain: bool = False) -> list[Path]:
+        """Syncs every session; returns the log paths that were (re)created this pass. `drain`
+        is passed through to each TextLog.sync() — see its docstring."""
+        refs = [s if isinstance(s, SessionRef) else as_ref(s[2]) for s in sessions]
+        created: list[Path] = []
+        seen_inodes: set[tuple[int, int]] = set()
+        for ref in refs:
+            try:
+                st = ref.path.stat()
+            except OSError as exc:
+                self.errors[ref.path] = f"{exc.strerror or exc}"
+                continue
+            if (st.st_dev, st.st_ino) in seen_inodes:
+                continue
+            seen_inodes.add((st.st_dev, st.st_ino))
+            try:
+                log = self.logs.get(ref.path)
+                if log is None:
+                    log = self.logs[ref.path] = TextLog(self.log_dir, ref)
+                if log.fresh:
+                    created.append(log.path)
+                log.sync(drain=drain)
+                if self.ledger is not None:
+                    self.ledger.record(ref, log.usage)
+                self.errors.pop(ref.path, None)
+            except OSError as exc:
+                self.errors[ref.path] = f"{exc.strerror or exc}"
+        self._write_index(refs)
+        return created
+
+    def _write_index(self, refs: list[SessionRef]) -> None:
+        index = {ref.source_key: self.logs[ref.path].path.name for ref in refs if ref.path in self.logs}
+        with contextlib.suppress(OSError):
+            (self.log_dir / "index.json").write_text(json.dumps(index, indent=2), encoding="utf-8")
+
+    def mark_latest(self, path: Path) -> None:
+        """Repoints `latest.log` at `path`'s mirror, if one exists."""
+        if path in self.logs:
+            point_latest(self.log_dir, self.logs[path].path)
+
+
+def mirror(root: Path | list[RootSel], log_dir: Path, poll: float, once: bool,
+           ledger_dir: Path | None = DEFAULT_LEDGER_DIR) -> None:
+    """Headless: keep plain-text logs (and the usage ledger) of every live session up to date."""
+    roots = as_roots(root)
+    mirrors = MirrorSet(log_dir, Ledger(ledger_dir) if ledger_dir else None)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    print(f"mirroring {root} → {log_dir}\n  tail -F {log_dir / LATEST_LOG}", file=sys.stderr, flush=True)
+    last_rescan = -RESCAN_SECS
+    sessions: list[SessionRef] = []
+    while True:
+        now = time.monotonic()
+        if now - last_rescan >= RESCAN_SECS:
+            last_rescan = now
+            sessions = discovery_snapshot(roots)
+        for created in mirrors.sync(sessions, drain=once):
+            print(f"  + {created.name}", file=sys.stderr, flush=True)
+        main_ref = newest_main(sessions)
+        if main_ref is not None:
+            mirrors.mark_latest(main_ref.path)
+        if once:
+            return
+        time.sleep(poll)
+
+
+# ── ANSI → curses ───────────────────────────────────────────────────────────
+
+SGR_RESET = (-1, False, False, False, False)  # fg, bold, dim, italic, underline
+
+
+def apply_sgr(state: tuple, codes: str) -> tuple:
+    fg, bold, dim, ital, ul = state
+    for part in codes.split(";") if codes else ["0"]:
+        try:
+            n = int(part or "0")
+        except ValueError:
+            continue
+        if n == 0:
+            fg, bold, dim, ital, ul = SGR_RESET
+        elif n == 1:
+            bold = True
+        elif n == 2:
+            dim = True
+        elif n == 3:
+            ital = True
+        elif n == 4:
+            ul = True
+        elif n == 22:
+            bold = dim = False
+        elif n == 23:
+            ital = False
+        elif n == 24:
+            ul = False
+        elif 30 <= n <= 37:
+            fg = n - 30
+        elif n == 39:
+            fg = -1
+        elif n == 90:
+            fg, dim = -1, True
+        elif 91 <= n <= 97:
+            fg, bold = n - 90, True
+    return fg, bold, dim, ital, ul
+
+
+def state_attr(state: tuple) -> int:
+    fg, bold, dim, ital, ul = state
+    attr = 0
+    if COLORS_OK and 0 <= fg < 8:
+        attr |= curses.color_pair(fg + 1)
+    if bold:
+        attr |= curses.A_BOLD
+    if dim:
+        attr |= curses.A_DIM
+    if ital:
+        attr |= getattr(curses, "A_ITALIC", curses.A_DIM)
+    if ul:
+        attr |= curses.A_UNDERLINE
+    return attr
+
+
+def sgr_prefix(state: tuple) -> str:
+    if state == SGR_RESET:
+        return ""
+    fg, bold, dim, ital, ul = state
+    codes = []
+    if bold:
+        codes.append("1")
+    if dim:
+        codes.append("2")
+    if ital:
+        codes.append("3")
+    if ul:
+        codes.append("4")
+    if fg >= 0:
+        codes.append(str(30 + fg))
+    return "\033[" + ";".join(codes) + "m"
+
+
+def wrap_ansi(line: str, width: int) -> list[str]:
+    if width <= 4 or len(strip_ansi(line)) <= width:
+        return [line]
+    rows: list[str] = []
+    state = SGR_RESET
+    cur = ""
+    used = 0
+    for i, tok in enumerate(ANSI_RE.split(line)):
+        if i % 2:
+            state = apply_sgr(state, tok)
+            cur += f"\033[{tok}m"
+            continue
+        text = tok
+        while text:
+            space = width - used
+            if space <= 0:
+                rows.append(cur)
+                cur = sgr_prefix(state)
+                used = 0
+                space = width
+            piece = text[:space]
+            cur += piece
+            used += len(piece)
+            text = text[len(piece):]
+    rows.append(cur)
+    return rows
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
+
+
+def draw_ansi(stdscr: Any, row: int, col: int, line: str, width: int, base: int = 0) -> None:
+    if row < 0 or col < 0 or width <= 0 or row >= stdscr.getmaxyx()[0]:
+        return
+    x = col
+    state = SGR_RESET
+    for i, tok in enumerate(ANSI_RE.split(line)):
+        if i % 2:
+            state = apply_sgr(state, tok)
+            continue
+        if not tok:
+            continue
+        remain = width - (x - col)
+        if remain <= 0:
+            break
+        piece = tok[:remain]
+        with contextlib.suppress(curses.error):
+            stdscr.addnstr(row, x, piece, remain, state_attr(state) | base)
+        x += len(piece)
+
+
+def safe_add(stdscr: Any, row: int, col: int, text: str, width: int, attr: int = 0) -> None:
+    if row < 0 or col < 0 or width <= 0 or row >= stdscr.getmaxyx()[0]:
+        return
+    with contextlib.suppress(curses.error):
+        stdscr.addnstr(row, col, strip_ansi(text), max(1, width), attr)
+
+
+# ── interactive dashboard ───────────────────────────────────────────────────
+
+HELP = ("tab/1-9 sess · j/k d/u g/G scroll · f follow · / n N find · w wrap · m md · "
+        "t think · a active · r roots · q quit")
+PL = ""  # powerline separator
+
+# background pairs 9-14: cyan, green, yellow, red, magenta, blue
+SEG_PAIRS = [(0, 6), (0, 2), (0, 3), (7, 1), (0, 5), (7, 4), (0, 7)]
+GLYPHS = {"working": ("●", "1;32"), "stale": ("◐", "1;33"), "done": ("✔", "90"), "error": ("✖", "1;31"),
+          "unknown": ("◌", "90")}
+ENTER_KEYS = (10, 13, getattr(curses, "KEY_ENTER", -3))
+
+
+def cp(n: int, fallback: int = 0) -> int:
+    return curses.color_pair(n) if COLORS_OK else fallback
+
+
+def draw_segments(stdscr: Any, row: int, segs: list[tuple[str, int]], width: int) -> None:
+    x = 0
+    for text, attr in segs:
+        if x >= width:
+            break
+        with contextlib.suppress(curses.error):
+            stdscr.addnstr(row, x, text, width - x, attr)
+        x += len(text)
+
+
+def read_line(stdscr: Any, prompt: str) -> str | None:
+    height, width = stdscr.getmaxyx()
+    stdscr.timeout(-1)
+    curses.curs_set(1)
+    buf = ""
+    try:
+        while True:
+            safe_add(stdscr, height - 1, 0, (prompt + buf).ljust(width - 1), width - 1, curses.A_REVERSE)
+            with contextlib.suppress(curses.error):
+                stdscr.move(height - 1, min(len(prompt + buf), width - 2))
+            try:
+                key = stdscr.get_wch()
+            except curses.error:
+                continue
+            if key in ("\n", "\r"):
+                return buf
+            if key == "\x1b":
+                return None
+            if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                buf = buf[:-1]
+            elif isinstance(key, str) and key.isprintable():
+                buf += key
+    finally:
+        curses.curs_set(0)
+        stdscr.timeout(80)
+
+
+def choose(stdscr: Any, title: str, rows: list[str], selected: int = 0) -> int | None:
+    """Full-screen single-select list; returns the chosen index or None on escape."""
+    stdscr.timeout(-1)
+    selected = max(0, min(selected, len(rows) - 1))
+    try:
+        while True:
+            height, width = stdscr.getmaxyx()
+            stdscr.erase()
+            safe_add(stdscr, 0, 0, f" {title} ".ljust(width - 1), width - 1, curses.A_REVERSE | curses.A_BOLD)
+            visible = max(1, height - 3)
+            top = max(0, selected - visible + 1)
+            for i, row in enumerate(rows[top:top + visible], start=top):
+                marker = "▶" if i == selected else " "
+                attr = curses.A_REVERSE if i == selected else 0
+                safe_add(stdscr, 2 + i - top, 0, f"{marker} {row}".ljust(width - 1), width - 1, attr)
+            safe_add(stdscr, height - 1, 0, " j/k move · enter select · esc cancel ", width - 1, curses.A_DIM)
+            key = stdscr.getch()
+            if key in (27, ord("q")):
+                return None
+            if key in ENTER_KEYS:
+                return selected if rows else None
+            if key in (curses.KEY_DOWN, ord("j")):
+                selected = min(len(rows) - 1, selected + 1)
+            elif key in (curses.KEY_UP, ord("k")):
+                selected = max(0, selected - 1)
+    finally:
+        stdscr.timeout(80)
+
+
+def pick_roots(stdscr: Any, current: list[RootSel]) -> list[RootSel] | None:
+    """Multi-select over saved ∪ discovered roots; space toggles, enter saves, esc cancels."""
+    choices = merge_root_choices(current, discover_all_roots())
+    selected = 0
+    stdscr.timeout(-1)
+    try:
+        while True:
+            height, width = stdscr.getmaxyx()
+            stdscr.erase()
+            safe_add(stdscr, 0, 0, " TRANSCRIPT ROOTS — space toggles · a adds a path · enter saves ".ljust(
+                width - 1), width - 1, curses.A_REVERSE | curses.A_BOLD)
+            for i, sel in enumerate(choices[: max(1, height - 4)]):
+                mark = "✔" if sel.enabled else " "
+                tag = FORMATS[sel.fmt_name].tag
+                row = f"[{mark}] {tag}  {sel.path}"
+                safe_add(stdscr, 2 + i, 0, row.ljust(width - 1), width - 1,
+                         curses.A_REVERSE if i == selected else 0)
+            key = stdscr.getch()
+            if key in (27, ord("q")):
+                return None
+            if key in ENTER_KEYS:
+                return choices
+            if key in (curses.KEY_DOWN, ord("j")):
+                selected = min(len(choices) - 1, selected + 1)
+            elif key in (curses.KEY_UP, ord("k")):
+                selected = max(0, selected - 1)
+            elif key == ord(" ") and choices:
+                sel = choices[selected]
+                choices[selected] = sel._replace(enabled=not sel.enabled)
+            elif key == ord("a"):
+                typed = read_line(stdscr, "root path: ")
+                if typed:
+                    path = Path(typed).expanduser()
+                    fmt = detect_root_format(path)
+                    if fmt is None:
+                        answer = read_line(stdscr, "format (codex/claude): ")
+                        fmt = FORMATS.get((answer or "").strip(), CODEX)
+                    choices.append(RootSel(fmt.name, path, True))
+    finally:
+        stdscr.timeout(80)
+
+
+def find_match(lines: list[str], needle: str, start: int, step: int) -> int | None:
+    needle = needle.lower()
+    n = len(lines)
+    i = start
+    while 0 <= i < n:
+        if needle in strip_ansi(lines[i]).lower():
+            return i
+        i += step
+    return None
+
+
+def init_colors() -> None:
+    global COLORS_OK
+    if not curses.has_colors():
+        return
+    curses.start_color()
+    curses.use_default_colors()
+    for i in range(8):
+        with contextlib.suppress(curses.error):
+            curses.init_pair(i + 1, i, -1)
+    for idx, (fg, bg) in enumerate(SEG_PAIRS, start=9):
+        with contextlib.suppress(curses.error):
+            curses.init_pair(idx, fg, bg)
+    COLORS_OK = True
+
+
+def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None, poll: float,
+                          log_dir: Path | None = None, config_path: Path = DEFAULT_CONFIG,
+                          ledger_dir: Path | None = DEFAULT_LEDGER_DIR, active_only: bool = False,
+                          window: float = DEFAULT_ACTIVE_WINDOW_SECS) -> None:
+    global MD_ON
+    curses.curs_set(0)
+    stdscr.timeout(80)
+    init_colors()
+    wheel_up = getattr(curses, "BUTTON4_PRESSED", 0)
+    wheel_dn = getattr(curses, "BUTTON5_PRESSED", 0)
+    with contextlib.suppress(curses.error):
+        curses.mousemask(wheel_up | wheel_dn)
+    STYLE.enabled = True
+
+    caches: dict[Path, TranscriptCache] = {}
+    ledger = Ledger(ledger_dir) if ledger_dir else None
+    mirrors = MirrorSet(log_dir, ledger) if log_dir else None
+    sessions: list[SessionRef] = []
+    states: dict[Path, str] = {}
+    checked: dict[Path, tuple[float, float]] = {}
+    selected = 0
+    offset = 0
+    follow = True
+    wrap_on = True
+    dirty = True
+    needle = ""
+    status_msg = ""
+    pane_h = 1
+    last_rescan = 0.0
+    hidden = 0
+    discovered: list[SessionRef] = []
+    last_update = 0.0
+    last_bg = 0.0
+    current_roots: list[RootSel] = list(roots)
+    first_enabled = next((sel for sel in current_roots if sel.enabled), None)
+    root: Path | None = first_enabled.path if first_enabled is not None else None
+
+    if single is not None:
+        sessions = [as_ref(single)._replace(name=single.stem[-12:], role="file")]
+        refresh_states(sessions, caches, states, 0.0, checked)
+
+    def cache_for(path: Path) -> TranscriptCache:
+        if path not in caches:
+            ref = next((r for r in sessions if r.path == path), path)
+            caches[path] = TranscriptCache(ref)
+        return caches[path]
+
+    def record_usage(ref: SessionRef) -> None:
+        if ledger is not None and ref.path in caches:
+            with contextlib.suppress(OSError):
+                ledger.record(ref, caches[ref.path].usage)
+
+    def known_usage(ref: SessionRef) -> Usage | None:
+        if ref.path in caches:
+            return caches[ref.path].usage
+        return ledger.known(ref.source_key) if ledger else None
+
+    def session_tokens(ref: SessionRef) -> str:
+        usage = known_usage(ref)
+        return format_tokens(usage.total) if usage is not None and usage.total else "·"
+
+    def session_model(ref: SessionRef) -> str:
+        return model_cell(known_usage(ref))
+
+    def switch(index: int) -> None:
+        nonlocal selected, follow, status_msg, dirty
+        selected = index % max(1, len(sessions))
+        follow = True
+        status_msg = ""
+        dirty = True
+
+    while True:
+        now = time.monotonic()
+        if single is None and current_roots and now - last_rescan >= RESCAN_SECS:
+            last_rescan = now
+            fresh = discovered = discovery_snapshot(current_roots)
+            if refresh_states(fresh, caches, states, now, checked, window):
+                dirty = True
+            hidden = 0
+            if active_only:
+                shown = filter_active(fresh, states, time.time(), window)
+                hidden, fresh = len(fresh) - len(shown), shown
+            if [(r.path, r.name, r.role) for r in fresh] != [(r.path, r.name, r.role) for r in sessions]:
+                current = sessions[selected].path if sessions else None
+                sessions = fresh
+                paths = [r.path for r in sessions]
+                selected = paths.index(current) if current in paths else 0
+                dirty = True
+        if sessions and now - last_update >= poll:
+            last_update = now
+            if cache_for(sessions[selected].path).update():
+                dirty = True
+                record_usage(sessions[selected])
+        if sessions and now - last_bg >= BG_UPDATE_SECS:
+            last_bg = now
+            if refresh_states(sessions, caches, states, now, checked, window):
+                dirty = True
+            for ref in sessions:
+                if ref.path != sessions[selected].path and ref.path in caches and caches[ref.path].update():
+                    dirty = True
+                    record_usage(ref)
+            if mirrors is not None:
+                mirrors.sync(discovered or sessions)      # the activity filter is display-only
+                if discovered or sessions:
+                    mirrors.mark_latest((discovered or sessions)[0].path)
+
+        if dirty:
+            dirty = False
+            try:
+                stdscr.erase()
+                height, width = stdscr.getmaxyx()
+            except curses.error:
+                continue
+            live = sum(1 for ref in sessions if states.get(ref.path) == "working")
+            draw_segments(stdscr, 0, [
+                (" ⚡ CODEX ", cp(9, curses.A_REVERSE) | curses.A_BOLD),
+                (PL, cp(7)),
+                ("  " + HELP, curses.A_DIM),
+            ], width - 1)
+            info = f" {live}● live · {len(sessions)} sessions "
+            safe_add(stdscr, 0, max(0, width - 1 - len(info)), info, len(info), curses.A_DIM)
+            if not sessions:
+                where = root if root is not None else "(no Codex sessions dir found — press r)"
+                safe_add(stdscr, 2, 1, f"Waiting for transcripts under {where} …", width - 2, curses.A_DIM)
+                if status_msg:
+                    safe_add(stdscr, 3, 1, status_msg, width - 2, curses.A_DIM)
+            else:
+                ref = sessions[selected]
+                name, role, path = ref.name, ref.role, ref.path
+                cache = cache_for(path)
+                list_h = 0 if single is not None or len(sessions) < 2 else min(len(sessions), max(2, height // 5))
+                log_top = 1
+                footer_row = height - 1
+                show_model = height >= 8                     # optional rows yield before the transcript
+                model_row = footer_row - (1 if show_model else 0)
+                if list_h and model_row - list_h - 1 - log_top < 1:
+                    list_h = max(0, model_row - 2 - log_top)
+                    list_h = list_h if list_h >= 2 else 0
+                sep_row = model_row - list_h - (1 if list_h else 0)
+                log_h = max(1, sep_row - log_top)
+                pane_h = log_h
+                wrap_w = max(10, width - 2)
+                lines = cache.wrapped(wrap_w, wrap_on)
+                max_off = max(0, len(lines) - log_h)
+                if follow:
+                    offset = max_off
+                offset = max(0, min(offset, max_off))
+                for row, line in enumerate(lines[offset:offset + log_h], start=log_top):
+                    draw_ansi(stdscr, row, 0, line, wrap_w)
+                if len(lines) > log_h:  # scrollbar
+                    thumb_h = max(1, log_h * log_h // len(lines))
+                    thumb_top = log_top + (offset * (log_h - thumb_h)) // max(1, max_off)
+                    for row in range(log_top, log_top + log_h):
+                        if thumb_top <= row < thumb_top + thumb_h:
+                            safe_add(stdscr, row, width - 1, "█", 1, cp(7))
+                        else:
+                            safe_add(stdscr, row, width - 1, "│", 1, curses.A_DIM)
+                if list_h:
+                    safe_add(stdscr, sep_row, 0, "─" * (width - 1), width - 1, curses.A_DIM)
+                    lbl = f" AGENTS {live}●/{len(sessions)} " + (f"({hidden} idle hidden) " if hidden else "")
+                    safe_add(stdscr, sep_row, 2, lbl, width - 3, cp(7) | curses.A_BOLD)
+                    first = max(0, min(selected - list_h + 1, len(sessions) - list_h))
+                    for i, srow in enumerate(sessions[first:first + list_h]):
+                        idx = first + i
+                        sname, srole, spath = srow.name, srow.role, srow.path
+                        state = states.get(spath, STATE_UNKNOWN)
+                        glyph, color = GLYPHS[state]
+                        marker = "▶" if idx == selected else " "
+                        label = (f"{marker} {idx + 1:>2} " + STYLE.paint(color, glyph) + " "
+                                 + STYLE.paint("90", f"{srow.fmt.tag} ")
+                                 + f"{sname:<24.24} " + STYLE.paint("90", f"{srole:<10.10} ")
+                                 + STYLE.paint(color, f"{state:<8}")
+                                 + STYLE.paint("36", f"{session_tokens(srow):>6} ")
+                                 + STYLE.paint("35", f"{session_model(srow):<{MODEL_CELL_WIDTH}} ")
+                                 + STYLE.paint("90", spath.name))
+                        base = curses.A_REVERSE if idx == selected else 0
+                        draw_ansi(stdscr, sep_row + 1 + i, 0, label.ljust(width - 1), width - 1, base)
+                shown = min(offset + log_h, len(lines))
+                pct = shown * 100 // len(lines) if lines else 100
+                if show_model:
+                    gear = model_line(cache.usage) or "⚙ model not seen yet"
+                    safe_add(stdscr, model_row, 0, f" {gear}".ljust(width - 1), width - 1, cp(5) | curses.A_BOLD)
+                segs = [
+                    (f"  {name} ", cp(9, curses.A_REVERSE) | curses.A_BOLD), (PL, cp(7)),
+                    (f" {role} ", cp(13, curses.A_REVERSE)), (PL, cp(6)),
+                    (f" {shown}/{len(lines)} · {pct}% ", cp(14, curses.A_REVERSE)), (PL, cp(5)),
+                ]
+                tally = usage_line(cache.usage)
+                if tally:
+                    segs += [(f" Σ {tally} ", cp(15, curses.A_REVERSE)), (PL, cp(8))]
+                if follow:
+                    segs += [(" ⏵ FOLLOW ", cp(10, curses.A_REVERSE) | curses.A_BOLD), (PL, cp(3))]
+                else:
+                    segs += [(" ⏸ PAUSED ", cp(11, curses.A_REVERSE) | curses.A_BOLD), (PL, cp(4))]
+                segs.append((f" {'WRAP' if wrap_on else 'CUT'}·{'MD' if MD_ON else 'RAW'}", curses.A_DIM))
+                if mirrors is not None:
+                    segs.append((" ·LOG", curses.A_DIM))
+                if status_msg:
+                    segs.append((f" · {status_msg}", cp(4)))
+                segs.append(("  " + path.name, curses.A_DIM))
+                draw_segments(stdscr, footer_row, segs, width - 1)
+
+        key = stdscr.getch()
+        while key != -1:
+            height, _ = stdscr.getmaxyx()
+            page = max(1, height - 4)
+            if key in (ord("q"), 27):
+                return
+            if key == curses.KEY_RESIZE:
+                pass
+            elif key in (curses.KEY_DOWN, ord("j")):
+                offset += 1
+            elif key in (curses.KEY_UP, ord("k")):
+                offset -= 1
+                follow = False
+            elif key == ord("d"):
+                offset += page // 2
+            elif key == ord("u"):
+                offset -= page // 2
+                follow = False
+            elif key in (curses.KEY_NPAGE, ord(" ")):
+                offset += page
+            elif key in (curses.KEY_PPAGE, ord("b")):
+                offset -= page
+                follow = False
+            elif key in (curses.KEY_HOME, ord("g")):
+                offset = 0
+                follow = False
+            elif key in (curses.KEY_END, ord("G"), ord("f")):
+                follow = not follow if key == ord("f") else True
+            elif key == ord("\t"):
+                switch(selected + 1)
+            elif key == getattr(curses, "KEY_BTAB", -2):
+                switch(selected - 1)
+            elif ord("1") <= key <= ord("9") and key - ord("1") < len(sessions):
+                switch(key - ord("1"))
+            elif key == ord("w"):
+                wrap_on = not wrap_on
+            elif key == ord("m"):
+                MD_ON = not MD_ON
+                for c in caches.values():  # re-render from disk under the new mode
+                    c.reset()
+                if sessions:
+                    cache_for(sessions[selected].path).update()
+                status_msg = f"markdown {'on' if MD_ON else 'off'}"
+            elif key == ord("t"):
+                DISPLAY_OPTS["thinking"] = not DISPLAY_OPTS["thinking"]
+                for c in caches.values():
+                    c.reset()
+                if sessions:
+                    cache_for(sessions[selected].path).update()
+                status_msg = f"thinking {'on' if DISPLAY_OPTS['thinking'] else 'off'}"
+            elif key == ord("a") and single is None:
+                active_only = not active_only
+                last_rescan = -RESCAN_SECS
+                status_msg = f"active-only {'on' if active_only else 'off'}"
+                save_config(config_path, {**load_config(config_path), "active_only": active_only})
+            elif key == ord("r") and single is None:
+                chosen = pick_roots(stdscr, current_roots)
+                if chosen is not None:
+                    current_roots = chosen
+                    save_error = save_config(config_path, {**load_config(config_path), **roots_payload(chosen)})
+                    first_enabled = next((sel for sel in chosen if sel.enabled), None)
+                    if first_enabled is not None and first_enabled.path != root:
+                        root = first_enabled.path
+                        sessions = []
+                        selected = 0
+                    last_rescan = 0.0
+                    status_msg = save_error if save_error is not None else "roots saved"
+            elif key == ord("/") and sessions:
+                query = read_line(stdscr, "search: ")
+                if query:
+                    needle = query
+                    lines = cache_for(sessions[selected].path).wrapped(max(10, stdscr.getmaxyx()[1] - 2), wrap_on)
+                    hit = find_match(lines, needle, offset + 1, 1)
+                    if hit is None:
+                        hit = find_match(lines, needle, 0, 1)
+                    if hit is not None:
+                        offset, follow = hit, False
+                        status_msg = f"/{needle}"
+                    else:
+                        status_msg = f"no match: {needle}"
+            elif key in (ord("n"), ord("N")) and needle and sessions:
+                lines = cache_for(sessions[selected].path).wrapped(max(10, stdscr.getmaxyx()[1] - 2), wrap_on)
+                step = 1 if key == ord("n") else -1
+                hit = find_match(lines, needle, offset + step, step)
+                if hit is not None:
+                    offset, follow = hit, False
+                    status_msg = f"/{needle}"
+                else:
+                    status_msg = f"no more: {needle}"
+            elif key == curses.KEY_MOUSE:
+                try:
+                    button = curses.getmouse()[4]
+                except curses.error:
+                    button = 0
+                if button & wheel_up:
+                    offset -= 3
+                    follow = False
+                elif button & wheel_dn:
+                    offset += 3
+            dirty = True
+            key = stdscr.getch()
+        # scrolling to the very bottom re-engages follow
+        if dirty and sessions:
+            cache = cache_for(sessions[selected].path)
+            if offset >= len(cache.wrapped(max(10, stdscr.getmaxyx()[1] - 2), wrap_on)) - pane_h:
+                follow = True
+
+
+# ── plain (non-tty) mode ────────────────────────────────────────────────────
+
+def agent_footer(refs: list[SessionRef], current: SessionRef | None) -> str:
+    parent = current.parent_id if current else None
+    entries = [(r.name, r.role, r.path.name) for r in refs
+               if r.kind == "subagent" and (parent is None or r.parent_id == parent)]
+    if not entries:
+        return ""
+    lines = [STYLE.paint("1;90", "╰─ active sub-agents")]
+    for name, role, filename in sorted(set(entries), key=lambda item: item[0].lower()):
+        lines.append(STYLE.paint("90", f"   {name:<12} {role:<8} {filename}"))
+    return "\n".join(lines)
+
+
+def follow(path: Path | None, root: Path | list[RootSel] | None, once: bool, poll: float,
+           log_dir: Path | None = None, ledger_dir: Path | None = DEFAULT_LEDGER_DIR) -> None:
+    printed = False
+    dedupe = Deduper()
+    ledger = Ledger(ledger_dir) if ledger_dir else None
+    mirrors = MirrorSet(log_dir, ledger) if log_dir else None
+    roots = as_roots(root)
+    current_ref: SessionRef | None = as_ref(path) if path is not None else None
+    counter = UsageCounter(current_ref.fmt if current_ref is not None else CODEX)
+    last_usage = last_model = ""
+
+    def persist_usage() -> None:
+        if ledger is not None and current_ref is not None:
+            with contextlib.suppress(OSError):
+                ledger.record(current_ref, counter.snapshot())
+
+    def report_usage() -> None:
+        """Print the running tally when it changed, and persist it to the ledger."""
+        nonlocal last_usage, last_model
+        snapshot = counter.snapshot()
+        line, gear = usage_line(snapshot), model_line(snapshot)
+        if line and line != last_usage:
+            print(STYLE.paint("1;90", f"╰─ Σ {line}"), flush=True)
+            last_usage = line
+        if gear and gear != last_model:
+            print(STYLE.paint("1;90", f"╰─ {gear}"), flush=True)
+            last_model = gear
+        persist_usage()
+
+    def emit(record: dict[str, Any]) -> None:
+        nonlocal printed
+        fmt = current_ref.fmt if current_ref is not None else CODEX
+        counter.feed(record)
+        rendered = fmt.render(record, DISPLAY_OPTS)
+        if rendered and (not fmt.dedupe or dedupe.fresh(rendered)):
+            print(rendered, flush=True)
+            printed = True
+
+    def drain(tail: NdjsonTail) -> None:
+        nonlocal dedupe, counter, last_usage, last_model
+        while True:
+            result = tail.read()
+            if result.truncated:              # a rewritten file is a new generation: start over
+                dedupe, counter, last_usage, last_model = Deduper(), UsageCounter(counter.fmt), "", ""
+            for record in result.records:
+                emit(record)
+            if result.records:
+                persist_usage()
+            if not result.more_pending:
+                return
+
+    current = path
+    tail: NdjsonTail | None = None
+    announced = False
+    last_footer = None
+    next_refresh = 0.0
+    while True:
+        if roots:
+            snapshot = discovery_snapshot(roots)
+            newest = newest_main(snapshot)
+            if newest is not None and newest.path != current:
+                report_usage()                # flush the outgoing session's final tally
+                current, current_ref, tail = newest.path, newest, None
+                dedupe, counter, last_usage, last_model = Deduper(), UsageCounter(newest.fmt), "", ""
+                print(STYLE.paint("1;90", f"\n── switched to {current.name} ──\n"), flush=True)
+        if current is None or not current.is_file():
+            if not announced:
+                print(f"Waiting for a transcript under {root or path}", flush=True)
+                announced = True
+            time.sleep(poll)
+            continue
+        if tail is None:
+            tail = NdjsonTail(current)
+            drain(tail)
+            if once:
+                report_usage()
+                if mirrors is not None:
+                    mirrors.sync([current_ref or as_ref(current)], drain=True)
+                    mirrors.mark_latest(current)
+                return
+            if not printed:
+                print(f"Watching {current}", flush=True)
+        if time.monotonic() >= next_refresh:
+            if roots:
+                footer = agent_footer(discovery_snapshot(roots), current_ref)
+                if footer != last_footer:
+                    if footer:
+                        print("\n" + footer + "\n", flush=True)
+                    elif last_footer:
+                        print("\n" + STYLE.paint("1;90", "╰─ no sub-agents currently visible") + "\n", flush=True)
+                    last_footer = footer
+            if mirrors is not None:
+                sessions = discovery_snapshot(roots) if roots else [current_ref or as_ref(current)]
+                mirrors.sync(sessions)
+                main_ref = newest_main(sessions) if roots else (current_ref or as_ref(current))
+                if main_ref is not None:
+                    mirrors.mark_latest(main_ref.path)
+            report_usage()
+            next_refresh = time.monotonic() + BG_UPDATE_SECS
+        before = tail.committed
+        drain(tail)
+        if tail.committed == before:
+            time.sleep(poll)
+
+
+def print_roots(infos: list[RootInfo], chosen: Path | None) -> None:
+    if not infos:
+        print("No Codex or Claude session roots found (looked at $CODEX_HOME, ~/.codex, ~/.claude/projects, "
+              "/mnt/*/Users/*, /home/*, /Users/*).")
+        return
+    for info in infos:
+        marker = "▶" if info.path == chosen else " "
+        tag = FORMATS[info.fmt_name].tag
+        print(f"{marker} {tag}  {info.path}  ·  {info.count} recent  ·  active {ago(info.newest)}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Read Codex rollout transcripts like a human.")
+    parser.add_argument("--file", type=Path, help="Transcript JSONL file to read")
+    parser.add_argument("--root", type=Path, help="Sessions root to scan (default: saved/discovered)")
+    parser.add_argument("--remember", action="store_true", help="Save --root as the default root")
+    parser.add_argument("--list-roots", action="store_true", help="List discovered Codex sessions roots and exit")
+    parser.add_argument("--once", action="store_true", help="Print existing records and exit")
+    parser.add_argument("--poll", type=float, default=0.5, help="Follow polling interval in seconds")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
+    parser.add_argument("--no-markdown", action="store_true", help="Render messages raw instead of markdown")
+    parser.add_argument("--no-thinking", action="store_true",
+                        help="Hide Claude thinking blocks in the TUI and on stdout "
+                             "(text logs always include them)")
+    parser.add_argument("--plain", action="store_true", help="Disable the interactive dashboard")
+    parser.add_argument("--log-dir", type=Path, nargs="?", const=DEFAULT_LOG_DIR, default=None,
+                        help=f"Also write plain-text logs per session (default dir: {DEFAULT_LOG_DIR})")
+    parser.add_argument("--mirror", action="store_true",
+                        help="Headless: only keep the plain-text logs up to date (implies --log-dir)")
+    parser.add_argument("--active", action="store_true",
+                        help="Only list sessions that are working or were written to within --active-window "
+                             "(toggle with `a` in the TUI; the choice is remembered)")
+    parser.add_argument("--active-window", type=parse_duration, default=None, metavar="DURATION",
+                        help="Activity window, e.g. 30m or 2h (default 1h); also when 'working' turns 'stale'")
+    parser.add_argument("--ledger-dir", type=Path, default=DEFAULT_LEDGER_DIR,
+                        help=f"Where per-session token-usage JSON files go (default: {DEFAULT_LEDGER_DIR})")
+    parser.add_argument("--no-ledger", action="store_true", help="Do not persist token usage to the ledger")
+    parser.add_argument("--format", choices=["codex", "claude"], default=None,
+                        help="Force the transcript format for --root/--file instead of detecting it")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    global MD_ON
+    MD_ON = not args.no_markdown
+    DISPLAY_OPTS["thinking"] = not args.no_thinking
+    STYLE.enabled = sys.stdout.isatty() and not args.no_color
+    poll = max(args.poll, 0.05)
+    config = load_config(DEFAULT_CONFIG)
+    discovered = discover_all_roots() if args.root is None or args.list_roots else []
+    root = resolve_root(args.root, config, discovered)
+    if args.list_roots:
+        print_roots(discovered, root)
+        return 0
+    if args.remember and args.root is not None:
+        fmt = FORMATS[args.format] if args.format else detect_root_format(args.root)
+        sel = RootSel((fmt or CODEX).name, args.root, True)
+        save_config(DEFAULT_CONFIG, {**config, **roots_payload([sel])})
+        print(f"Saved default root: {args.root}", file=sys.stderr)
+    if args.root is not None and args.format is None and detect_root_format(args.root) is None:
+        print(f"Cannot tell which agent wrote transcripts under {args.root}; "
+              f"pass --format codex|claude", file=sys.stderr)
+        return 1
+    log_dir = args.log_dir or (DEFAULT_LOG_DIR if args.mirror else None)
+    ledger_dir = None if args.no_ledger else args.ledger_dir
+    active_only = args.active or bool(config.get("active_only"))
+    window = args.active_window if args.active_window is not None else DEFAULT_ACTIVE_WINDOW_SECS
+    # Every discovered root, not just the newest one: the default view is the merged list.
+    discovered_sel = [RootSel(info.fmt_name, info.path, True) for info in discovered]
+    roots = resolve_roots(args.root, args.format, config, discovered_sel)
+    path = args.file
+    if path is None and args.once and root is not None:
+        path = newest_transcript(root)
+    if path is None and root is None and not args.mirror and not (sys.stdout.isatty() and sys.stdin.isatty()):
+        print("No Codex or Claude session roots found; pass --root DIR (see --list-roots)", file=sys.stderr)
+        return 1
+    if args.once and (path is None or not path.is_file()):
+        print(f"No Codex transcript found under {root}", file=sys.stderr)
+        return 1
+    try:
+        if args.mirror:
+            if root is None:
+                print("No Codex or Claude session roots found; pass --root DIR", file=sys.stderr)
+                return 1
+            mirror(roots, log_dir, poll, args.once, ledger_dir)
+            return 0
+        if sys.stdout.isatty() and sys.stdin.isatty() and not args.once and not args.plain:
+            curses.wrapper(interactive_dashboard, roots, args.file, poll, log_dir, ledger_dir=ledger_dir,
+                           active_only=active_only, window=window)
+            return 0
+        follow(path, None if args.file else roots, args.once, poll, log_dir, ledger_dir)
+    except KeyboardInterrupt:
+        print("\nStopped.", file=sys.stderr)
+    except BrokenPipeError:  # e.g. piped into `head`
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,96 @@
+{
+  "verdict": "rework",
+  "summary": "The adapter approach is viable, but the spec leaves material gaps in mirror identity, streaming correctness, state detection, and integration with existing entry points. Six read-only probes confirmed implementation hazards. No files were modified. GitHub source verification was blocked; format-specific research used Anthropic’s public documentation.",
+  "findings": [
+    {
+      "severity": "high",
+      "section": "Architecture / Discovery — TextLog and MirrorSet",
+      "issue": "TextLog names both logs and checkpoints solely from source.stem (codex-human-transcript.py:734–737). Two roots containing the same session filename, or two parent sessions containing agent-abc.jsonl, therefore share output and offset files. MirrorSet distinguishes their source paths but sends both writers to the same destination, causing overwrites, interleaving, and incorrect resume offsets. Adding a format prefix alone does not prevent same-format collisions.",
+      "recommendation": "Define a stable source identity incorporating format, root/project, parent session, and agent identity. Deduplicate aliases of the same physical source. Specify how existing Codex log names remain compatible, and test simultaneous basename collisions and subsequent restarts."
+    },
+    {
+      "severity": "high",
+      "section": "Architecture / Error handling — follow(), NdjsonTail, TextLog",
+      "issue": "The spec assumes existing tailing can simply receive an adapter, but follow() uses text readline(), not NdjsonTail. A JSON record split across writes is consumed as separate malformed fragments and permanently lost. Separately, TextLog persists tail.offset after all bytes read, including an unfinished record held only in memory; restarting loses that record’s prefix. Both loss mechanisms were reproduced with read-only probes.",
+      "recommendation": "Use one incremental framing implementation across live modes. Persist the byte boundary of the last completely processed record, preserving correct UTF-8 handling. Test split JSON, split multibyte characters, restart between writes, and a complete record followed by an incomplete record in the same read."
+    },
+    {
+      "severity": "high",
+      "section": "Rendering — shared clean() and kv_lines() rules",
+      "issue": "Passing text through clean() does not provide the claimed key-based redaction when using kv_lines(). That function passes each value separately to clean(), discarding its key; an input such as {\"api_key\":\"EXAMPLE_NOT_A_SECRET\"} is printed unchanged. clean() also redacts dictionary keys only at the outermost level. The specified generic Claude tool renderer would carry these failures into persistent mirrors.",
+      "recommendation": "Redact structured Claude inputs recursively before extracting or formatting values. Preserve key context in generic tool rendering, and add nested-input and plain-mirror redaction tests."
+    },
+    {
+      "severity": "high",
+      "section": "Architecture / Testing — large transcripts",
+      "issue": "NdjsonTail.read() reads the entire remaining file and materializes every parsed record; TextLog additionally accumulates all rendered blocks before writing. Dashboard mirroring runs synchronously, so opening large Claude transcripts can freeze the TUI or exhaust memory despite MAX_CACHED_LINES. Conversely, the 512 KiB display backfill discards the record intersecting its starting offset: a single final 600 KiB record produced an empty cache in a probe. clean() truncation happens too late to address either problem.",
+      "recommendation": "Specify bounded reads, bounded processing per dashboard iteration, and an explicit oversized-record policy. Stream mirror output instead of retaining a full-file batch. Test large individual records, large append bursts, and initial mirroring of multiple large files."
+    },
+    {
+      "severity": "medium",
+      "section": "Discovery — Claude state",
+      "issue": "An assistant end_turn is not sufficient evidence that the Claude Code workflow has stopped: Stop hooks can force continued work. The proposed transitions can leave hook-driven or meta-driven continuation marked done until a tool_use appears. Completion without either proposed marker, interruption, and recovery after an API error are unspecified. The spec also does not establish marker availability across supported main and subagent transcript versions. [Anthropic’s Stop documentation](https://code.claude.com/docs/en/hooks#stop) describes continuation and version-dependent transcript timing.",
+      "recommendation": "Define status as a conservative transcript-derived observation, including an unknown state when evidence is insufficient. Specify continuation, interruption, and error-recovery rules using version-tagged real disk fixtures, rather than assuming API completion fields constitute a durable session lifecycle protocol."
+    },
+    {
+      "severity": "medium",
+      "section": "Architecture — has_completed() contract",
+      "issue": "A boolean has_completed() cannot agree with a three-state reducer. An unopened transcript ending in an API error must display either working or done under the current dashboard logic. The existing 16 KiB substring scan also cannot reliably establish the last transition when markers fall outside the window, records cross its boundary, or matching fields occur inside nested tool data. The proposed agreement test covers only working/done and misses this contradiction.",
+      "recommendation": "Expose a full state snapshot for unopened files, using the same validated transition classifier as incremental processing. Define record alignment, scan limits, and unknown results explicitly. Retain a Codex compatibility wrapper if required, and test errors, trailing bookkeeping, oversized records, and nested marker-like data."
+    },
+    {
+      "severity": "medium",
+      "section": "Architecture — dashboard and TranscriptCache",
+      "issue": "Correct adapter functions alone will not keep dashboard status current. Unopened sessions are inspected only during redraw, while rescans mark the screen dirty only when the ordered path list changes. A background session can finish without either event. TranscriptCache.update() also reports changes only for rendered output, and reset()/truncation preserve the previous state. Copying the markdown toggle for thinking inherits that stale-state behavior.",
+      "recommendation": "Refresh lightweight status for displayed sessions independently of rendering and list membership. Treat state transitions as changes, and explicitly reinitialize or reconstruct state on cache reset and file-generation changes. Test background completion without keyboard input and state changes carried by hidden records."
+    },
+    {
+      "severity": "medium",
+      "section": "Architecture — adapter contracts and entry-point wiring",
+      "issue": "The claimed direct rebinding does not match the existing interfaces: Codex next_state() accepts a payload kind, whereas the adapter accepts a record. main(), follow(), agent_footer(), and discover_roots() also call Codex-specific newest_transcript(), recent_rollouts(), and subagent_identity() outside the listed neutral layers. Selection semantics differ already: newest_transcript() can select a subagent, while MirrorSet treats the first main-first list entry as latest. The spec does not resolve these differences for merged roots.",
+      "recommendation": "Define a small normalized session descriptor with format, path, main/subagent kind, parent identity, name, role, and mtime. Add explicit compatibility wrappers and a call-site migration map. Specify selection for plain follow, --once, --file, --mirror, latest.log, and agent_footer(), including cross-format switches."
+    },
+    {
+      "severity": "medium",
+      "section": "Discovery — enumeration cost and subagent eligibility",
+      "issue": "Filtering mains by mtime still requires enumerating and statting historical files across every project directory. Subagent discovery adds traversal of session directories, with no stated age rule or relationship to eligible mains. In follow(), newest_transcript() currently runs on every loop iteration, even while consuming buffered lines; a direct multi-root replacement could repeatedly scan the whole Claude history. Applying list limits afterward does not bound this work.",
+      "recommendation": "Share a discovery snapshot across selection, footer, mirrors, and root counts, refreshed on a defined cadence. Avoid reading metadata before candidate selection where possible. Define subagent eligibility independently of the three-main display limit, including a recently resumed agent under an older parent. Add filesystem-operation-count tests over many historical projects."
+    },
+    {
+      "severity": "medium",
+      "section": "Discovery — metadata, sidecars, and subagent identity",
+      "issue": "The first record carrying sessionId need not also carry cwd or gitBranch. Reusing the existing permanent metadata cache would freeze incomplete results and missing or partially written sidecars. Even refreshed descriptions would remain invisible because dashboard rescans compare only paths. The metadata contract also fails to distinguish a Claude parent session ID from the agent’s own identity, which agent_footer() needs for family filtering.",
+      "recommendation": "Define parent-session and agent IDs separately, deriving them from the documented directory structure when necessary. Collect metadata fields independently, distinguish initial from current values, and invalidate incomplete metadata and sidecars when their files change. Refresh dashboard descriptors when names or roles change. Test delayed sidecars and resumed sessions."
+    },
+    {
+      "severity": "medium",
+      "section": "Architecture / Discovery — format detection",
+      "issue": "‘First records’ has no byte or record limit, and ‘otherwise Codex’ conflates a proven Codex file with an empty, partially written, bookkeeping-only, or unsupported file. A newly created Claude --file can therefore be assigned the wrong renderer before its first message arrives. Layout inference likewise cannot classify an empty --root directory or resolve a mixed layout.",
+      "recommendation": "Use positive signatures for both formats and an unknown result. Preserve known formats from discovery/config, bound sniffing, and retry unresolved live files after growth. Provide an explicit format choice for ambiguous manual roots/files. Test empty-to-populated files, leading bookkeeping, partial first records, and misleading filenames."
+    },
+    {
+      "severity": "medium",
+      "section": "Discovery — root picker and config migration",
+      "issue": "The multi-root migration only specifies legacy loading and picker saving. Existing --remember and change_root() write the singular root key, resolve_root() returns one Path, and pick_root() supports manually entered paths. The new design leaves precedence between root and roots, CLI overrides, roots: [], custom saved roots absent from discovery, and newly discovered roots undefined. These choices determine whether a saved selection is respected or unrelated roots are silently enabled.",
+      "recommendation": "Specify one resolver and persistence contract covering every writer and consumer. Distinguish missing configuration from an intentionally empty selection, retain custom roots in the picker, validate entries, and define --remember migration and CLI precedence. Add round-trip tests, not just a legacy-load test."
+    },
+    {
+      "severity": "medium",
+      "section": "Rendering — --no-thinking and persistent mirrors",
+      "issue": "TextLog resumes solely from an offset and records no rendering configuration. Restarting with --no-thinking against a previously mirrored transcript leaves all existing thinking in the log, contrary to an unqualified ‘hides thinking in --mirror output’ promise. Conversely, enabling thinking cannot recover previously omitted blocks. A global TUI toggle would also affect future mirror writes without rebuilding their history, producing inconsistent logs.",
+      "recommendation": "Specify whether thinking visibility is a display-only preference or a mirror-generation option. For mirrors, include rendering options/version in checkpoint validity and rebuild or use distinct destinations when they change. Test reuse of existing logs under both flag values and toggling while mirroring."
+    },
+    {
+      "severity": "medium",
+      "section": "Rendering / Testing — resumed, forked, and compacted history",
+      "issue": "The spec does not choose between displaying physical append history and reconstructing the active conversation. A stateless record renderer has no policy for replayed records, branch changes, synthetic compaction summaries, or repeated message identifiers. For example, a user record marked isCompactSummary but not isMeta satisfies the stated YOU/working rules. Anthropic’s own browser example explicitly reconstructs a message chain. [Session-browser cookbook](https://platform.claude.com/cookbook/claude-agent-sdk-05-building-a-session-browser)",
+      "recommendation": "Choose and document append-history versus active-chain semantics. Define handling of summary/replay records and identifier reuse without deduplicating distinct content blocks merely because they share a message ID. Add real resumed, forked, compacted, and multi-block fixtures; isolated badge tests cannot establish transcript fidelity."
+    },
+    {
+      "severity": "medium",
+      "section": "Error handling — validation and per-file failures",
+      "issue": "‘Wrong-shaped fields render None’ does not protect code that inspects those fields before rendering, including detection, metadata, and next_state(). records() validates only that the top-level JSON value is a dictionary. Likewise, skipping unreadable roots does not handle readable directories containing unreadable or concurrently deleted transcripts: follow() opens files without catching OSError, while mirror/config writes can terminate the dashboard. The never-crashes constraint is therefore not supported by the specified boundaries.",
+      "recommendation": "Validate shapes before every semantic consumer and isolate expected per-source failures so one bad transcript does not stop other sessions. Surface concise read/write failure status instead of treating failures as empty transcripts. Add malformed nested fields, non-object sidecars, permission failures, deletion races, and unwritable mirror/config tests."
+    }
+  ]
+}
