@@ -38,7 +38,6 @@ from __future__ import annotations
 import argparse
 import codecs
 import contextlib
-import curses
 import hashlib
 import json
 import os
@@ -51,6 +50,14 @@ from collections import deque
 from pathlib import Path
 from collections.abc import Callable, Iterable
 from typing import Any, NamedTuple
+
+try:
+    import curses
+except ModuleNotFoundError as exc:
+    if exc.name not in ("curses", "_curses"):
+        raise
+    curses = None
+
 
 SECRET_KEYS = re.compile(r"(token|secret|password|authorization|api[_-]?key|cookie)", re.I)
 ANSI_RE = re.compile(r"\033\[([0-9;]*)m")
@@ -2970,7 +2977,9 @@ def main() -> int:
     path = args.file
     if path is None and args.once and root is not None:
         path = newest_transcript(root)
-    if path is None and root is None and not args.mirror and not (sys.stdout.isatty() and sys.stdin.isatty()):
+    dashboard = (curses is not None and sys.stdout.isatty() and sys.stdin.isatty()
+                 and not args.once and not args.plain)
+    if path is None and root is None and not args.mirror and not dashboard:
         print("No Codex or Claude session roots found; pass --root DIR (see --list-roots)", file=sys.stderr)
         return 1
     if args.once and (path is None or not path.is_file()):
@@ -2983,7 +2992,7 @@ def main() -> int:
                 return 1
             mirror(roots, log_dir, poll, args.once, ledger_dir)
             return 0
-        if sys.stdout.isatty() and sys.stdin.isatty() and not args.once and not args.plain:
+        if dashboard:
             curses.wrapper(interactive_dashboard, roots, args.file, poll, log_dir, ledger_dir=ledger_dir,
                            active_only=active_only, window=window)
             return 0

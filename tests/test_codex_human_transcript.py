@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,22 @@ def _load():
 cht = _load()
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "claude"
+
+
+def test_terminal_follows_transcript_without_curses(monkeypatch, capsys):
+    monkeypatch.setitem(sys.modules, "curses", None)
+    module = _load()
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--root", str(FIXTURES), "--file",
+                                     str(FIXTURES / "resumed.jsonl"), "--no-ledger"])
+
+    def stop_after_reading(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(time, "sleep", stop_after_reading)
+    assert module.main() == 0
+    assert "text-0" in capsys.readouterr().out
 
 
 def rec(kind: str, ts: str = "2026-08-20T10:00:00.000Z", top: str = "response_item", **payload):
