@@ -1852,6 +1852,26 @@ class UsageCounter:
         return Usage.from_state(self._state)
 
 
+class SessionUsageReader:
+    """Follow an unopened conversation without rendering or storing its transcript."""
+
+    def __init__(self, ref: SessionRef):
+        self.tail = NdjsonTail(ref.path)
+        self.counter = UsageCounter(ref.fmt)
+        self.usage: Usage | None = None
+
+    def update(self) -> bool:
+        """Read one chunk and publish totals at EOF. Return whether more bytes await."""
+        batch = self.tail.read()
+        if batch.truncated:
+            self.counter = UsageCounter(self.counter.fmt)
+        for record in batch.records:
+            self.counter.feed(record)
+        if not batch.more_pending and (batch.records or batch.truncated or self.tail.offset):
+            self.usage = self.counter.snapshot()
+        return batch.more_pending
+
+
 def usage_scan(counter: UsageCounter, path: Path, end: int) -> None:
     """Feed the records in bytes [0, end) of `path`: the region a backfilled tail skipped."""
     tail = NdjsonTail(path)
@@ -2327,6 +2347,19 @@ def safe_add(stdscr: Any, row: int, col: int, text: str, width: int, attr: int =
 
 HELP = ("tab/1-9 sess · j/k d/u g/G scroll · f follow · / n N find · w wrap · m md · "
         "t think · a active · r roots · q quit")
+
+
+def shortcut_rows(width: int) -> list[str]:
+    rows = [""]
+    for hint in HELP.split(" · "):
+        joined = f"{rows[-1]} · {hint}" if rows[-1] else hint
+        if rows[-1] and len(joined) > width:
+            rows.append(hint)
+        else:
+            rows[-1] = joined
+    return rows
+
+
 PL = ""  # powerline separator
 
 # background pairs 9-14: cyan, green, yellow, red, magenta, blue
@@ -2515,10 +2548,14 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
         sessions = [as_ref(single)._replace(name=single.stem[-12:], role="file")]
         refresh_states(sessions, caches, states, 0.0, checked)
 
+    usage_readers: dict[Path, SessionUsageReader] = {}
+    usage_queue: deque[SessionRef] = deque()
+
     def cache_for(path: Path) -> TranscriptCache:
         if path not in caches:
             ref = next((r for r in sessions if r.path == path), path)
             caches[path] = TranscriptCache(ref)
+            usage_readers.pop(path, None)
         return caches[path]
 
     def record_usage(ref: SessionRef) -> None:
@@ -2529,6 +2566,9 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
     def known_usage(ref: SessionRef) -> Usage | None:
         if ref.path in caches:
             return caches[ref.path].usage
+        reader = usage_readers.get(ref.path)
+        if reader is not None and reader.usage is not None:
+            return reader.usage
         return ledger.known(ref.source_key) if ledger else None
 
     def session_tokens(ref: SessionRef) -> str:
@@ -2561,6 +2601,10 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
                 sessions = fresh
                 paths = [r.path for r in sessions]
                 selected = paths.index(current) if current in paths else 0
+                usage_queue.clear()
+                for removed in usage_readers.keys() - set(paths):
+                    del usage_readers[removed]
+                last_bg = -BG_UPDATE_SECS
                 dirty = True
         if sessions and now - last_update >= poll:
             last_update = now
@@ -2575,10 +2619,28 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
                 if ref.path != sessions[selected].path and ref.path in caches and caches[ref.path].update():
                     dirty = True
                     record_usage(ref)
+            queued = {ref.path for ref in usage_queue}
+            usage_queue.extend(ref for ref in sessions if ref.path not in caches and ref.path not in queued)
             if mirrors is not None:
                 mirrors.sync(discovered or sessions)      # the activity filter is display-only
                 if discovered or sessions:
                     mirrors.mark_latest((discovered or sessions)[0].path)
+
+        # One chunk per input cycle keeps cold-start accounting out of transcript rendering.
+        if usage_queue:
+            ref = usage_queue.popleft()
+            if ref.path not in caches:
+                if ref.path not in usage_readers:
+                    usage_readers[ref.path] = SessionUsageReader(ref)
+                reader = usage_readers[ref.path]
+                previous = reader.usage
+                if reader.update():
+                    usage_queue.append(ref)
+                if reader.usage is not None and reader.usage != previous:
+                    dirty = True
+                    if ledger is not None:
+                        with contextlib.suppress(OSError):
+                            ledger.record(ref, reader.usage)
 
         if dirty:
             dirty = False
@@ -2591,10 +2653,11 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
             draw_segments(stdscr, 0, [
                 (" ⚡ CODEX ", cp(9, curses.A_REVERSE) | curses.A_BOLD),
                 (PL, cp(7)),
-                ("  " + HELP, curses.A_DIM),
             ], width - 1)
             info = f" {live}● live · {len(sessions)} sessions "
             safe_add(stdscr, 0, max(0, width - 1 - len(info)), info, len(info), curses.A_DIM)
+            hints = shortcut_rows(width - 2)[:max(1, height - 4)]
+            help_top = height - len(hints)
             if not sessions:
                 where = root if root is not None else "(no Codex sessions dir found — press r)"
                 safe_add(stdscr, 2, 1, f"Waiting for transcripts under {where} …", width - 2, curses.A_DIM)
@@ -2606,7 +2669,7 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
                 cache = cache_for(path)
                 list_h = 0 if single is not None or len(sessions) < 2 else min(len(sessions), max(2, height // 5))
                 log_top = 1
-                footer_row = height - 1
+                footer_row = help_top - 1
                 show_model = height >= 8                     # optional rows yield before the transcript
                 model_row = footer_row - (1 if show_model else 0)
                 if list_h and model_row - list_h - 1 - log_top < 1:
@@ -2675,6 +2738,8 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
                     segs.append((f" · {status_msg}", cp(4)))
                 segs.append(("  " + path.name, curses.A_DIM))
                 draw_segments(stdscr, footer_row, segs, width - 1)
+            for row, hint in enumerate(hints, start=help_top):
+                safe_add(stdscr, row, 1, hint, width - 2, curses.A_DIM)
 
         key = stdscr.getch()
         while key != -1:

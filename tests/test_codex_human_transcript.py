@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -2013,3 +2014,76 @@ def test_model_cell_keeps_the_effort_visible_for_long_model_names():
     assert cht.model_cell(usage._replace(model="gpt-6-astra", effort="xhigh")) == "gpt-6-astra/xhigh"
     cell = cht.model_cell(usage._replace(model="claude-sonnet-4-5-20250929", effort="high"))
     assert cell.endswith("/high") and len(cell) <= cht.MODEL_CELL_WIDTH
+
+
+@pytest.fixture
+def dashboard_frame(monkeypatch):
+    class Screen:
+        def __init__(self, width):
+            self.width = width
+            self.erase()
+
+        def erase(self):
+            self.rows = [" " * self.width for _ in range(24)]
+
+        def getmaxyx(self):
+            return len(self.rows), self.width
+
+        def addnstr(self, row, col, value, limit, attr):
+            part = value[:limit]
+            line = self.rows[row]
+            self.rows[row] = line[:col] + part + line[col + len(part):]
+
+        def timeout(self, delay):
+            pass
+
+        def getch(self):
+            return ord("q")
+
+    def render(refs, width):
+        screen = Screen(width)
+        monkeypatch.setattr(cht, "discovery_snapshot", lambda roots: refs)
+        monkeypatch.setattr(cht, "init_colors", lambda: None)
+        monkeypatch.setattr(cht, "curses", SimpleNamespace(
+            curs_set=lambda value: None, mousemask=lambda value: None, error=RuntimeError,
+            A_BOLD=1, A_DIM=2, A_REVERSE=4, A_UNDERLINE=8,
+        ))
+        monkeypatch.setattr(cht.STYLE, "enabled", False)
+        cht.interactive_dashboard(screen, [cht.RootSel("codex", Path("."), True)], None, 0, ledger_dir=None)
+        return screen.rows
+
+    return render
+
+
+def test_dashboard_populates_unopened_session_on_start(tmp_path, dashboard_frame):
+    refs = [cht.as_ref(write_rollout(tmp_path / f"{name}.jsonl", [
+        meta(id=name), turn_context(name, "high"), codex_tokens(400, 0, 32)
+    ])) for name in ("first", "second")]
+    rows = dashboard_frame(refs, 150)
+    assert any("432" in row and "second/high" in row for row in rows)
+
+
+def test_dashboard_shortcuts_below_statistics_at_standard_width(tmp_path, dashboard_frame):
+    ref = cht.as_ref(write_rollout(tmp_path / "first.jsonl", [meta(), codex_tokens(400, 0, 32)]))
+    rows = dashboard_frame([ref], 80)
+    stats = next(i for i, row in enumerate(rows) if "Σ" in row)
+    assert "tab/1-9" in " ".join(rows[stats + 1:])
+    assert "q quit" in rows[-1]
+
+
+def test_unopened_usage_across_chunks_append_and_truncation(tmp_path):
+    path = write_rollout(tmp_path / "large.jsonl", [
+        turn_context("first", "high"), {"padding": "x" * cht.READ_CHUNK_BYTES}, codex_tokens(100, 0, 5)
+    ])
+    reader = cht.SessionUsageReader(cht.as_ref(path))
+    assert reader.update()
+    assert reader.usage is None
+    assert not reader.update()
+    assert (reader.usage.total, reader.usage.model) == (105, "first")
+    with path.open("a") as handle:
+        handle.write(json.dumps(codex_tokens(200, 0, 10)) + "\n")
+    assert not reader.update()
+    assert reader.usage.total == 210
+    write_rollout(path, [turn_context("second", "low")])
+    assert not reader.update()
+    assert (reader.usage.total, reader.usage.model, reader.usage.effort) == (0, "second", "low")
