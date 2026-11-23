@@ -1833,12 +1833,12 @@ class Usage(NamedTuple):
                    model=safe_label(state.get("model")), effort=safe_label(state.get("effort")))
 
 
-def safe_label(value: Any) -> str | None:
+def safe_label(value: Any, limit: int = LABEL_LIMIT) -> str | None:
     """A model/effort name from an untrusted transcript or ledger: escapes stripped, one line, bounded."""
     if not isinstance(value, str):
         return None
-    text = " ".join(CTRL_RE.sub("", clean(value, LABEL_LIMIT * 4)).split())
-    return text[:LABEL_LIMIT] or None
+    text = " ".join(CTRL_RE.sub("", clean(value, limit * 4)).split())
+    return text[:limit] or None
 
 
 class UsageCounter:
@@ -2364,6 +2364,9 @@ def safe_add(stdscr: Any, row: int, col: int, text: str, width: int, attr: int =
 EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 
 
+V2_EFFORT_BLOCKED = "v2 worker: direct effort changes blocked"
+
+
 def adjust_worker_effort(ref: SessionRef, direction: int, rpc: Callable,
                          on_target: Callable[[str], None] | None = None) -> str:
     """Change the loaded worker's next-turn default and verify it independently."""
@@ -2384,6 +2387,8 @@ def adjust_worker_effort(ref: SessionRef, direction: int, rpc: Callable,
             raise ValueError(f"Worker unavailable: {status}")
         if not thread.get("path") or Path(thread["path"]).resolve() != ref.path.resolve():
             raise ValueError("Worker rollout path differs on daemon")
+        if thread.get("canAcceptDirectInput") is False:
+            raise ValueError(V2_EFFORT_BLOCKED)
         return thread
 
     thread = read_worker()
@@ -2453,7 +2458,10 @@ def change_worker_effort(ref: SessionRef, direction: int, on_target: Callable[[s
                 if "method" in reply or reply.get("id") != request_id:
                     continue
                 if "error" in reply:
-                    raise ValueError(safe_label(reply["error"].get("message")) or "Daemon rejected request")
+                    message = reply["error"].get("message")
+                    if message == "direct app-server input is not allowed for multi-agent v2 sub-agents":
+                        raise ValueError(V2_EFFORT_BLOCKED)
+                    raise ValueError(safe_label(message, 240) or "Daemon rejected request")
                 return reply["result"]
             raise TimeoutError("Daemon confirmation timed out")
 
@@ -2777,7 +2785,7 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
                 try:
                     confirmed[pending_path] = pending.result()
                 except Exception as exc:
-                    effort_errors[pending_path] = safe_label(str(exc)) or "Daemon confirmation failed"
+                    effort_errors[pending_path] = safe_label(str(exc), 240) or "Daemon confirmation failed"
                     confirmed.pop(pending_path, None)
                 pending = None
                 pending_path = None

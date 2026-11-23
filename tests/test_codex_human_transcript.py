@@ -2140,7 +2140,8 @@ def test_worker_effort_fails_closed(tmp_path, problem):
     assert len(writes) == (1 if problem == "unconfirmed" else 0)
 
 
-def test_dashboard_worker_glows_until_socket_readback(tmp_path, monkeypatch, dashboard_frame):
+@pytest.mark.parametrize("access", ["allowed", "denied", "denied_at_update"])
+def test_dashboard_worker_effort_response(tmp_path, monkeypatch, dashboard_frame, access):
     import tempfile
     import threading
 
@@ -2173,6 +2174,10 @@ def test_dashboard_worker_glows_until_socket_readback(tmp_path, monkeypatch, das
                               [{"reasoningEffort": "low"}, {"reasoningEffort": "high"}]}]}
                 elif method == "thread/settings/update":
                     writes.append(msg["params"])
+                    if access == "denied_at_update":
+                        ws.send(json.dumps({"id": msg["id"], "error": {"code": -32600, "message":
+                            "direct app-server input is not allowed for multi-agent v2 sub-agents"}}))
+                        continue
                     effort = msg["params"]["effort"]
                     result = {}
                 else:
@@ -2182,6 +2187,8 @@ def test_dashboard_worker_glows_until_socket_readback(tmp_path, monkeypatch, das
                     result = {"thread": {"id": "child", "path": str(path), "model": "worker-model",
                               "status": {"type": "active"}, "reasoningEffort": effort,
                               "source": {"subagent": {"thread_spawn": {"parent_thread_id": "root"}}}}}
+                    if access == "denied":
+                        result["thread"]["canAcceptDirectInput"] = False
                 ws.send(json.dumps({"id": msg["id"], "result": result}))
 
         sent = False
@@ -2195,6 +2202,9 @@ def test_dashboard_worker_glows_until_socket_readback(tmp_path, monkeypatch, das
                 sent = True
                 return ord("]")
             for i, row in enumerate(screen.rows):
+                if "v2 worker: direct effort changes blocked" in row:
+                    assert access != "allowed"
+                    return ord("q")
                 if "Next turn: high…" in row:
                     pulse_attrs.add(screen.attrs[i, 0])
                     if len(pulse_attrs) == 2:
@@ -2214,7 +2224,8 @@ def test_dashboard_worker_glows_until_socket_readback(tmp_path, monkeypatch, das
                 allow_readback.set()
                 daemon.shutdown()
                 thread.join(2)
-        assert writes == [{"threadId": "child", "effort": "high"}]
+        expected = [] if access == "denied" else [{"threadId": "child", "effort": "high"}]
+        assert writes == expected
 
 
 def test_effort_change_rechecks_worker_after_catalog_lookup(tmp_path):
