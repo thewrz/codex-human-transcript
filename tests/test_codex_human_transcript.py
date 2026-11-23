@@ -2025,11 +2025,13 @@ def dashboard_frame(monkeypatch):
 
         def erase(self):
             self.rows = [" " * self.width for _ in range(24)]
+            self.attrs = {}
 
         def getmaxyx(self):
             return len(self.rows), self.width
 
         def addnstr(self, row, col, value, limit, attr):
+            self.attrs[row, col] = attr
             part = value[:limit]
             line = self.rows[row]
             self.rows[row] = line[:col] + part + line[col + len(part):]
@@ -2038,15 +2040,21 @@ def dashboard_frame(monkeypatch):
             pass
 
         def getch(self):
-            return ord("q")
+            return on_key(self) if on_key else ord("q")
 
-    def render(refs, width):
+    on_key = None
+
+    def render(refs, width, key_handler=None):
+        nonlocal on_key
+        on_key = key_handler
         screen = Screen(width)
         monkeypatch.setattr(cht, "discovery_snapshot", lambda roots: refs)
         monkeypatch.setattr(cht, "init_colors", lambda: None)
         monkeypatch.setattr(cht, "curses", SimpleNamespace(
             curs_set=lambda value: None, mousemask=lambda value: None, error=RuntimeError,
             A_BOLD=1, A_DIM=2, A_REVERSE=4, A_UNDERLINE=8,
+            KEY_DOWN=258, KEY_UP=259, KEY_NPAGE=338, KEY_PPAGE=339, KEY_HOME=262,
+            KEY_END=360, KEY_RESIZE=410, KEY_MOUSE=409,
         ))
         monkeypatch.setattr(cht.STYLE, "enabled", False)
         cht.interactive_dashboard(screen, [cht.RootSel("codex", Path("."), True)], None, 0, ledger_dir=None)
@@ -2087,3 +2095,141 @@ def test_unopened_usage_across_chunks_append_and_truncation(tmp_path):
     write_rollout(path, [turn_context("second", "low")])
     assert not reader.update()
     assert (reader.usage.total, reader.usage.model, reader.usage.effort) == (0, "second", "low")
+
+
+@pytest.mark.parametrize("direction,current,target", [(1, None, "high"), (-1, "high", "low")])
+def test_worker_effort_steps_using_live_catalog_and_confirms(tmp_path, direction, current, target):
+    path = write_rollout(tmp_path / "worker.jsonl", [meta(id="child")])
+    ref = cht.as_ref(path)._replace(kind="subagent", session_id="child", parent_id="root")
+    thread = {"id": "child", "path": str(path), "status": {"type": "active"}, "model": "worker",
+              "source": {"subagent": {"thread_spawn": {"parent_thread_id": "root"}}},
+              "reasoningEffort": current}
+    calls = []
+    def rpc(method, params):
+        calls.append((method, params))
+        if method == "model/list":
+            return {"data": [{"model": "worker", "defaultReasoningEffort": "low",
+                               "supportedReasoningEfforts": [{"reasoningEffort": e} for e in ("high", "low")]}]}
+        if method == "thread/settings/update":
+            assert params == {"threadId": "child", "effort": target}
+            thread["reasoningEffort"] = target
+            return {}
+        assert method == "thread/read" and params == {"threadId": "child", "includeTurns": False}
+        return {"thread": thread.copy()}
+    assert cht.adjust_worker_effort(ref, direction, rpc) == target
+    assert calls[-1][0] == "thread/read"
+
+
+@pytest.mark.parametrize("problem", ["root", "idle", "other path", "limit", "unconfirmed"])
+def test_worker_effort_fails_closed(tmp_path, problem):
+    path = write_rollout(tmp_path / "worker.jsonl", [meta(id="child")])
+    ref = cht.as_ref(path)._replace(kind="subagent", session_id="child", parent_id="root")
+    writes = []
+    def rpc(method, params):
+        if method == "thread/read":
+            return {"thread": {"id": "child", "path": str(path) if problem != "other path" else "/elsewhere",
+                               "reasoningEffort": "high" if problem == "limit" else "low", "model": "m",
+                               "source": "cli" if problem == "root" else {"subagent": {"thread_spawn": {"parent_thread_id": "root"}}},
+                               "status": {"type": "idle" if problem == "idle" else "active"}}}
+        if method == "model/list":
+            return {"data": [{"model": "m", "supportedReasoningEfforts": [{"reasoningEffort": e} for e in ("low", "high")]}]}
+        writes.append(params)
+        return {}
+    with pytest.raises(ValueError):
+        cht.adjust_worker_effort(ref, 1, rpc)
+    assert len(writes) == (1 if problem == "unconfirmed" else 0)
+
+
+def test_dashboard_worker_glows_until_socket_readback(tmp_path, monkeypatch, dashboard_frame):
+    import tempfile
+    import threading
+
+    if not hasattr(__import__("socket"), "AF_UNIX"):
+        pytest.skip("requires a local Unix socket")
+    server = pytest.importorskip("websockets.sync.server")
+    # A short home keeps the socket inside the Unix socket path length limit.
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("CODEX_HOME", home)
+        socket = Path(home) / "app-server-control" / "app-server-control.sock"
+        socket.parent.mkdir()
+        path = write_rollout(tmp_path / "worker.jsonl", [
+            meta("subagent", id="child", source={"subagent": {"thread_spawn": {"parent_thread_id": "root"}}}),
+            turn_context("worker-model", "low")])
+        ref = cht.as_ref(path)
+        allow_readback = threading.Event()
+        writes = []
+        def handle(ws):
+            effort = "low"
+            for line in ws:
+                msg = json.loads(line)
+                method = msg["method"]
+                if method == "initialized":
+                    continue
+                if method == "initialize":
+                    assert msg["params"]["capabilities"]["experimentalApi"]
+                    result = {}
+                elif method == "model/list":
+                    result = {"data": [{"model": "worker-model", "supportedReasoningEfforts":
+                              [{"reasoningEffort": "low"}, {"reasoningEffort": "high"}]}]}
+                elif method == "thread/settings/update":
+                    writes.append(msg["params"])
+                    effort = msg["params"]["effort"]
+                    result = {}
+                else:
+                    assert method == "thread/read" and msg["params"]["threadId"] == "child"
+                    if writes:
+                        assert allow_readback.wait(4)
+                    result = {"thread": {"id": "child", "path": str(path), "model": "worker-model",
+                              "status": {"type": "active"}, "reasoningEffort": effort,
+                              "source": {"subagent": {"thread_spawn": {"parent_thread_id": "root"}}}}}
+                ws.send(json.dumps({"id": msg["id"], "result": result}))
+
+        sent = False
+        pulse_attrs = set()
+        deadline = time.monotonic() + 5
+        def key(screen):
+            nonlocal sent
+            assert time.monotonic() < deadline, screen.rows
+            if not sent:
+                assert any("[/] next-turn effort" in row for row in screen.rows)
+                sent = True
+                return ord("]")
+            for i, row in enumerate(screen.rows):
+                if "Next turn: high…" in row:
+                    pulse_attrs.add(screen.attrs[i, 0])
+                    if len(pulse_attrs) == 2:
+                        allow_readback.set()
+                elif "Next turn: high " in row:
+                    assert allow_readback.is_set() and "worker-model · low" in row
+                    return ord("q")
+            time.sleep(0.015)
+            return -1
+
+        with server.unix_serve(handle, str(socket)) as daemon:
+            thread = threading.Thread(target=daemon.serve_forever, daemon=True)
+            thread.start()
+            try:
+                dashboard_frame([ref], 100, key)
+            finally:
+                allow_readback.set()
+                daemon.shutdown()
+                thread.join(2)
+        assert writes == [{"threadId": "child", "effort": "high"}]
+
+
+def test_effort_change_rechecks_worker_after_catalog_lookup(tmp_path):
+    path = write_rollout(tmp_path / "worker.jsonl", [meta("subagent", id="child",
+        source={"subagent": {"thread_spawn": {"parent_thread_id": "root"}}})])
+    status = "active"
+    def rpc(method, params):
+        nonlocal status
+        if method == "thread/read":
+            return {"thread": {"id": "child", "path": str(path), "model": "m", "reasoningEffort": "low",
+                              "status": {"type": status}, "source": {"subagent": {"thread_spawn":
+                              {"parent_thread_id": "root"}}}}}
+        assert method == "model/list", "worker finished before the write"
+        status = "idle"
+        return {"data": [{"model": "m", "supportedReasoningEfforts": [
+            {"reasoningEffort": "low"}, {"reasoningEffort": "high"}]}]}
+    with pytest.raises(ValueError):
+        cht.adjust_worker_effort(cht.as_ref(path), 1, rpc)

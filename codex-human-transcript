@@ -46,8 +46,10 @@ import sqlite3
 import sys
 import tempfile
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections import deque
 from pathlib import Path
+from queue import Empty, SimpleQueue
 from collections.abc import Callable, Iterable
 from typing import Any, NamedTuple
 
@@ -739,6 +741,13 @@ def codex_status(ref: SessionRef) -> str | None:
     return states.get(thread_id) if thread_id else None
 
 
+def spawned_parent(source: Any) -> str | None:
+    sub = source.get("subagent") if isinstance(source, dict) else None
+    spawn = sub.get("thread_spawn") if isinstance(sub, dict) else None
+    parent = spawn.get("parent_thread_id") if isinstance(spawn, dict) else None
+    return parent if isinstance(parent, str) and parent else None
+
+
 def codex_discover(root: Path) -> list[SessionRef]:
     refs: list[SessionRef] = []
     home = codex_home(root / "x")
@@ -752,7 +761,7 @@ def codex_discover(root: Path) -> list[SessionRef]:
             name, role = label[0], label[1] or role
         refs.append(SessionRef(
             fmt=CODEX, path=path, kind="subagent" if identity else "main",
-            session_id=sid, parent_id=str(info.get("parent_thread_id") or sid),
+            session_id=sid, parent_id=str(info.get("parent_thread_id") or spawned_parent(info.get("source")) or sid),
             agent_id=path.stem if identity else None, name=name, role=role,
             cwd=info.get("cwd"), mtime=_mtime(path) or 0.0,
             source_key=source_key("codex", root, sid, path.stem if identity else None)))
@@ -886,6 +895,13 @@ def as_ref(source: Path | SessionRef) -> SessionRef:
         cwd = claude_meta(path).get("cwd")
         return SessionRef(fmt, path, "main", path.stem, path.stem, None, path.stem[-12:],
                           "session", cwd, _mtime(path) or 0.0, source_key("claude", path.parent, path.stem))
+    info = session_meta(path) or {}
+    identity = subagent_identity(info)
+    if identity and info.get("id"):
+        sid = str(info["id"])
+        parent = info.get("parent_thread_id") or spawned_parent(info.get("source"))
+        return SessionRef(fmt, path, "subagent", sid, parent, path.stem, *identity,
+                          info.get("cwd"), _mtime(path) or 0.0, source_key("codex", path.parent, sid, path.stem))
     return SessionRef(fmt, path, "main", path.stem, path.stem, None, path.stem[-12:],
                       "session", None, _mtime(path) or 0.0, source_key(fmt.name, path.parent, path.stem))
 
@@ -2345,13 +2361,109 @@ def safe_add(stdscr: Any, row: int, col: int, text: str, width: int, attr: int =
 
 # ── interactive dashboard ───────────────────────────────────────────────────
 
+EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
+
+def adjust_worker_effort(ref: SessionRef, direction: int, rpc: Callable,
+                         on_target: Callable[[str], None] | None = None) -> str:
+    """Change the loaded worker's next-turn default and verify it independently."""
+    if ref.fmt != CODEX or ref.kind != "subagent" or not ref.session_id or direction not in (-1, 1):
+        raise ValueError("Select a running Codex worker")
+
+    def read_worker() -> dict:
+        thread = rpc("thread/read", {"threadId": ref.session_id, "includeTurns": False})["thread"]
+        parent = spawned_parent(thread.get("source"))
+        if (thread["id"] != ref.session_id or not parent or parent != ref.parent_id
+                or parent == thread["id"] or thread["status"]["type"] not in ("active", "idle")
+                or not thread.get("path") or Path(thread["path"]).resolve() != ref.path.resolve()):
+            raise ValueError("Selected rollout is not a loaded worker on this daemon")
+        return thread
+
+    thread = read_worker()
+    if thread["status"]["type"] != "active":
+        raise ValueError("Worker has no active turn")
+    if not thread.get("model"):
+        raise ValueError("Worker model is unknown")
+    params: dict[str, Any] = {"includeHidden": True}
+    while True:
+        page = rpc("model/list", params)
+        model = next((m for m in page["data"] if thread["model"] in (m.get("model"), m.get("id"))), None)
+        if model:
+            break
+        if not page.get("nextCursor"):
+            raise ValueError("Worker model missing from daemon catalog")
+        params["cursor"] = page["nextCursor"]
+    supported = {item["reasoningEffort"] for item in model["supportedReasoningEfforts"]}
+    levels = [level for level in EFFORT_ORDER if level in supported]
+    current = thread.get("reasoningEffort") or model.get("defaultReasoningEffort")
+    if current not in levels:
+        raise ValueError("Worker effort is unknown")
+    idx = levels.index(current) + direction
+    if not 0 <= idx < len(levels):
+        raise ValueError(f"Already at the {'highest' if direction > 0 else 'lowest'} effort ({current})")
+    target = levels[idx]
+    latest = read_worker()
+    if (latest["status"]["type"] != "active" or latest.get("model") != thread["model"]
+            or latest.get("reasoningEffort") != thread.get("reasoningEffort")):
+        raise ValueError("Worker changed during lookup. Try again.")
+    if on_target:
+        on_target(target)
+    rpc("thread/settings/update", {"threadId": ref.session_id, "effort": target})
+    # Allow a short readback delay without repeating the write.
+    for delay in (0, 0.1, 0.25, 0.5):
+        if delay:
+            time.sleep(delay)
+        after = read_worker()
+        if after.get("model") != thread["model"]:
+            break
+        if after.get("reasoningEffort") == target:
+            return target
+        if after.get("reasoningEffort") != thread.get("reasoningEffort"):
+            break
+    raise ValueError(f"Daemon did not confirm {target}")
+
+
+def change_worker_effort(ref: SessionRef, direction: int, on_target: Callable[[str], None]) -> str:
+    try:
+        from websockets.sync.client import unix_connect
+    except ImportError as exc:
+        raise ValueError("Effort controls require Python websockets >= 12") from exc
+    # Only connect to the user's own daemon. Rollouts and browsed roots are untrusted.
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    socket = home / "app-server-control" / "app-server-control.sock"
+    if not socket.is_socket():
+        raise ValueError("Local Codex daemon is unavailable")
+    deadline = time.monotonic() + 6
+    with unix_connect(str(socket), open_timeout=2, close_timeout=1) as ws:
+        request_id = 0
+
+        def rpc(method: str, params: dict) -> dict:
+            nonlocal request_id
+            request_id += 1
+            ws.send(json.dumps({"id": request_id, "method": method, "params": params}))
+            while time.monotonic() < deadline:
+                reply = json.loads(ws.recv(timeout=max(0.01, deadline - time.monotonic())))
+                if "method" in reply or reply.get("id") != request_id:
+                    continue
+                if "error" in reply:
+                    raise ValueError(safe_label(reply["error"].get("message")) or "Daemon rejected request")
+                return reply["result"]
+            raise TimeoutError("Daemon confirmation timed out")
+
+        rpc("initialize", {"clientInfo": {"name": "codex-human-transcript", "version": "1"},
+                           "capabilities": {"experimentalApi": True}})
+        ws.send(json.dumps({"method": "initialized"}))
+        return adjust_worker_effort(ref, direction, rpc, on_target)
+
+
 HELP = ("tab/1-9 sess · j/k d/u g/G scroll · f follow · / n N find · w wrap · m md · "
         "t think · a active · r roots · q quit")
 
 
-def shortcut_rows(width: int) -> list[str]:
+def shortcut_rows(width: int, worker: bool = False) -> list[str]:
     rows = [""]
-    for hint in HELP.split(" · "):
+    help_text = ("[/] next-turn effort down/up · " if worker else "") + HELP
+    for hint in help_text.split(" · "):
         joined = f"{rows[-1]} · {hint}" if rows[-1] else hint
         if rows[-1] and len(joined) > width:
             rows.append(hint)
@@ -2578,6 +2690,14 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
     def session_model(ref: SessionRef) -> str:
         return model_cell(known_usage(ref))
 
+    # A single outstanding gesture prevents auto-repeat from stacking changes.
+    pending: Future | None = None
+    pending_path: Path | None = None
+    targets: SimpleQueue[str] = SimpleQueue()
+    pending_label = ""
+    confirmed: dict[Path, str] = {}
+    effort_errors: dict[Path, str] = {}
+
     def switch(index: int) -> None:
         nonlocal selected, follow, status_msg, dirty
         selected = index % max(1, len(sessions))
@@ -2642,6 +2762,19 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
                         with contextlib.suppress(OSError):
                             ledger.record(ref, reader.usage)
 
+        if pending is not None and pending_path is not None:
+            with contextlib.suppress(Empty):
+                pending_label = targets.get_nowait()
+            dirty = True
+            if pending.done():
+                try:
+                    confirmed[pending_path] = pending.result()
+                except Exception as exc:
+                    effort_errors[pending_path] = safe_label(str(exc)) or "Daemon confirmation failed"
+                    confirmed.pop(pending_path, None)
+                pending = None
+                pending_path = None
+        pulse = int(now * 4) % 2
         if dirty:
             dirty = False
             try:
@@ -2656,7 +2789,8 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
             ], width - 1)
             info = f" {live}● live · {len(sessions)} sessions "
             safe_add(stdscr, 0, max(0, width - 1 - len(info)), info, len(info), curses.A_DIM)
-            hints = shortcut_rows(width - 2)[:max(1, height - 4)]
+            worker = bool(sessions and sessions[selected].fmt == CODEX and sessions[selected].kind == "subagent")
+            hints = shortcut_rows(width - 2, worker)[:max(1, height - 4)]
             help_top = height - len(hints)
             if not sessions:
                 where = root if root is not None else "(no Codex sessions dir found — press r)"
@@ -2705,12 +2839,19 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
                         state = states.get(spath, STATE_UNKNOWN)
                         glyph, color = GLYPHS[state]
                         marker = "▶" if idx == selected else " "
+                        cell = session_model(srow)
+                        cell_color = "35"
+                        if spath == pending_path:
+                            cell_color = "1;95" if pulse else "2;35"
+                            cell += f" →{pending_label}…"
+                        elif spath in confirmed:
+                            cell += f" →{confirmed[spath]}"
                         label = (f"{marker} {idx + 1:>2} " + STYLE.paint(color, glyph) + " "
                                  + STYLE.paint("90", f"{srow.fmt.tag} ")
                                  + f"{sname:<24.24} " + STYLE.paint("90", f"{srole:<10.10} ")
                                  + STYLE.paint(color, f"{state:<8}")
                                  + STYLE.paint("36", f"{session_tokens(srow):>6} ")
-                                 + STYLE.paint("35", f"{session_model(srow):<{MODEL_CELL_WIDTH}} ")
+                                 + STYLE.paint(cell_color, f"{cell:<{MODEL_CELL_WIDTH}} ")
                                  + STYLE.paint("90", spath.name))
                         base = curses.A_REVERSE if idx == selected else 0
                         draw_ansi(stdscr, sep_row + 1 + i, 0, label.ljust(width - 1), width - 1, base)
@@ -2718,7 +2859,15 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
                 pct = shown * 100 // len(lines) if lines else 100
                 if show_model:
                     gear = model_line(cache.usage) or "⚙ model not seen yet"
-                    safe_add(stdscr, model_row, 0, f" {gear}".ljust(width - 1), width - 1, cp(5) | curses.A_BOLD)
+                    attr = cp(5) | curses.A_BOLD
+                    if path == pending_path:
+                        gear = f"Next turn: {pending_label}…   {gear}"
+                        attr = (cp(7) | curses.A_BOLD) if pulse else (cp(5) | curses.A_DIM)
+                    elif path in effort_errors:
+                        gear = f"{effort_errors[path]}   {gear}"
+                    elif path in confirmed:
+                        gear = f"Next turn: {confirmed[path]}   {gear}"
+                    safe_add(stdscr, model_row, 0, f" {gear}".ljust(width - 1), width - 1, attr)
                 segs = [
                     (f"  {name} ", cp(9, curses.A_REVERSE) | curses.A_BOLD), (PL, cp(7)),
                     (f" {role} ", cp(13, curses.A_REVERSE)), (PL, cp(6)),
@@ -2775,6 +2924,16 @@ def interactive_dashboard(stdscr: Any, roots: list[RootSel], single: Path | None
                 switch(selected - 1)
             elif ord("1") <= key <= ord("9") and key - ord("1") < len(sessions):
                 switch(key - ord("1"))
+            elif key in (ord("["), ord("]")) and sessions:
+                target = sessions[selected]
+                if target.fmt == CODEX and target.kind == "subagent" and pending is None:
+                    effort_errors.pop(target.path, None)
+                    pending_path = target.path
+                    pending_label = "higher" if key == ord("]") else "lower"
+                    targets = SimpleQueue()
+                    executor = ThreadPoolExecutor(max_workers=1)
+                    pending = executor.submit(change_worker_effort, target, 1 if key == ord("]") else -1, targets.put)
+                    executor.shutdown(wait=False)
             elif key == ord("w"):
                 wrap_on = not wrap_on
             elif key == ord("m"):
